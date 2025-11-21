@@ -408,3 +408,9 @@ Instructions to run the image can be found in the [official documentation](https
 ## References
 
 [1]: [LoRA](https://arxiv.org/abs/2106.09685): Low-Rank Adaptation of Large Language Models, Hu et al. 2021
+
+## License
+
+This library is licensed under the Apache 2.0 License. See the [LICENCE](./LICENCE) file for more information.
+
+*You must not use this library or our models in a manner that infringes, misappropriates, or otherwise violates any third party’s rights, including intellectual property rights.*
