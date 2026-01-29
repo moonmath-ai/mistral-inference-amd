@@ -1,0 +1,2 @@
+# keep .ipynb and .py files in sync with a .py file in the /jupytext_scripts/ subdirectory
+formats = "ipynb,jupytext_scripts//py:percent"
