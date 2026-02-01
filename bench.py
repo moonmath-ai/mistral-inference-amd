@@ -3,17 +3,24 @@ import os
 import numpy as np
 from openai import OpenAI
 import requests
+import argparse
 
-# 1. Configuration
-MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
-# MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+from chat import Chat
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="7b_instruct_v.3")
+parser.add_argument("--vllm", action="store_true")
+parser.add_argument("--multigpu", action="store_true")
+args = parser.parse_args()
+
+MODEL_FULL_NAMES = {
+    "7b_instruct_v.3": "mistralai/Mistral-7B-Instruct-v0.3",
+    "8x7b_instruct_v.1": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "8x22b_instruct_v.3": "mistralai/Mixtral-8x22B-Instruct-v0.1",
+}
 
 METRICS_URL = "http://localhost:8000/metrics"
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-
-
-# MODEL_SHORT = f"{MODEL_NAME.split('/')[-1]}_single_gpu"
-MODEL_SHORT = f"{MODEL_NAME.split('/')[-1]}_dual_gpu"
 
 # Ensure output directory exists
 os.makedirs("output/benchmarks", exist_ok=True)
@@ -53,26 +60,35 @@ prompts = [
     "Who keeps their coffee cold for a day?"
 ]
 
-def run_vllm_benchmark(prompt_list):
+def run_vllm_benchmark(model_name, prompt_list):
     results_summary = []
+
+    output_suffix = "_multigpu" if args.multigpu else "_single_gpu"
+
+    model_name = MODEL_FULL_NAMES[model_name]
+    model_name_short = model_name.split("/")[-1]
+
+    os.makedirs(f"output/benchmarks/{model_name_short}", exist_ok=True)
 
     # warmup
     warmup_prompt = "Write a haiku about a cat that walks on his head."
 
     print(f"Warming up model... ({warmup_prompt[:20]}...)")
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model_name,
         messages=[{"role": "user", "content": warmup_prompt}]
     )
     response_text = response.choices[0].message.content
     print(f"Warmed up model - response:\n{response_text}\n\n")
+
+    out_run_str = ""
 
     for i, prompt in enumerate(prompt_list):
         # 1. Take 'Before' snapshot
         before = get_vllm_internal_metrics()
 
         response = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=model_name,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -103,9 +119,11 @@ def run_vllm_benchmark(prompt_list):
             "latency": latency_sum_delta
         })
 
-        print(f"Prompt {i+1} Done: {int(out_tokens)} tokens | TPS: {tps:.2f} | TTFT: {ttft:.3f}s")
+        prompt_stat_str = f"Prompt {i+1} Done: {int(out_tokens)} tokens\t| TPS: {tps:.2f}\t| TTFT: {ttft:.3f}s"
+        print(prompt_stat_str)
+        out_run_str += prompt_stat_str + "\n"
         clean_name = "".join(c for c in prompt[:20] if c.isalnum() or c==' ').replace(" ", "_")
-        with open(f"output/benchmarks/model_{MODEL_SHORT}_output_{i}_{clean_name}.txt", "w") as f:
+        with open(f"output/benchmarks/{model_name_short}/vllm_output_{i}_{clean_name}_{output_suffix}.txt", "w") as f:
             f.write(f"Prompt: {prompt}\n\nOutput:\n{response_text}")
 
     time_to_first_token_avg = np.mean([result["ttft"] for result in results_summary])
@@ -113,79 +131,76 @@ def run_vllm_benchmark(prompt_list):
     tokens_per_second_avg = np.mean([result["tps"] for result in results_summary])
     tokens_per_second_std = np.std([result["tps"] for result in results_summary])
 
-    output_summary = f"\n{"="*50}\nModel: {MODEL_NAME}\n{"-"*50}\nTime To First Token: {time_to_first_token_avg:.5f}s ± {time_to_first_token_std:.6f}s\nTokens Per Second: {tokens_per_second_avg:.2f} ± {tokens_per_second_std:.2f} t/s\n{"="*50}\n"
+    output_summary = f"\n\n{"="*50}\nModel: {model_name}_{output_suffix}\n{"-"*50}\nTime To First Token: {time_to_first_token_avg:.5f}s ± {time_to_first_token_std:.6f}s\nTokens Per Second: {tokens_per_second_avg:.2f} ± {tokens_per_second_std:.2f} t/s\n{"="*50}\n"
     print(output_summary)
 
-    with open(f"output/benchmarks/model_{MODEL_SHORT}_summary.txt", "w") as f:
-        f.write(output_summary)
+    with open(f"output/benchmarks/{model_name_short}/vllm_summary_{output_suffix}.txt", "w") as f:
+        f.write(out_run_str + output_summary)
 
-def run_our_benchmark(prompt_list):
-    raw_latencies, output_tokens_counts, ttfts, tps_list = [], [], [], []
+def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
+    raw_latencies, output_tokens_counts, tps_list = [], [], []
 
-    print(f"Model: {MODEL_NAME}\nStarting benchmark on {len(prompt_list)} prompts...\n")
+    model_path =os.path.expanduser(f"~/models/{model_name}")
+    model_name = MODEL_FULL_NAMES[model_name]
+    model_name_short = model_name.split("/")[-1]
+
+    print(f"$$ Model: {model_name}, {model_name_short}")
+
+    output_suffix = "_multigpu" if args.multigpu else "_single_gpu"
+
+    chat = Chat(model_path)
+
+    os.makedirs(f"output/benchmarks/{model_name_short}", exist_ok=True)
+
+    out_run_str = ""
+
+    print(f"Model: {model_name_short}\nStarting benchmark on {len(prompt_list)} prompts...\n")
+
+    # warmup
+    warmup_prompt = "Write a haiku about a cat that walks on his head."
+
+    print(f"Warming up model... ({warmup_prompt[:20]}...)")
+    response, nof_tokens = chat(warmup_prompt)
+    print(f"Warmed up model - response:\n{response}\n\n")
 
     for i, prompt in enumerate(prompt_list):
         start_time = time.perf_counter()
-        first_token_time = None
-        tokens_generated = 0
-        full_response_text = "" # <--- INITIALIZE ACCUMULATOR
         
-        stream = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True
-        )
-        
-        for chunk in stream:
-            content = chunk.choices[0].delta.content
-            if content:
-                if first_token_time is None:
-                    first_token_time = time.perf_counter() - start_time
-                
-                full_response_text += content # <--- ACCUMULATE TEXT
-                tokens_generated += 1
+        response, nof_tokens = chat(prompt)
         
         end_time = time.perf_counter()
-        total_latency = end_time - start_time
-        
-        # Store Metrics
-        raw_latencies.append(round(total_latency, 3))
-        output_tokens_counts.append(tokens_generated)
-        ttfts.append(first_token_time)
-        tps_list.append(tokens_generated / total_latency)
-        
-        print(f"Prompt {i+1} Done: {tokens_generated} tokens in {total_latency:.2f}s")
+        latency = end_time - start_time
+
+        raw_latencies.append(latency)
+        output_tokens_counts.append(nof_tokens)
+        tps_list.append(nof_tokens / latency)
+
+        prompt_stat_str = f"Prompt {i+1} Done: {nof_tokens} tokens in {latency:.3f}s"
+        print(prompt_stat_str)
+        out_run_str += prompt_stat_str + "\n"
 
         # Create safe filename
         clean_name = "".join(c for c in prompt[:20] if c.isalnum() or c==' ').replace(" ", "_")
-        file_path = f"output/benchmarks/model_output_{i}_{clean_name}.txt"
+        file_path = f"output/benchmarks/{model_name_short}/{prefix}_output_{i}_{clean_name}_{output_suffix}.txt"
         
         with open(file_path, "w") as f:
-            f.write(f"Prompt: {prompt}\n\nModel Output:\n{full_response_text}") # <--- USE ACCUMULATED TEXT
+            f.write(f"Prompt: {prompt}\n\nModel Output:\n{response}") # <--- USE ACCUMULATED TEXT
     
     # ... (Rest of your metrics display code)
     print("\nAll outputs saved to output/benchmarks/")
-    
-    # 3. Displaying the Data
-    print("\n" + "="*50)
-    print("RAW DATA LISTS")
-    print("-" * 50)
-    print(f"Total Latencies (s):  {raw_latencies}")
-    print(f"Output Token Counts: {output_tokens_counts}")
-    
-    print("\n" + "="*50)
-    print("AGGREGATE HARDWARE METRICS")
-    print("-" * 50)
-    # We use these because they are length-independent 'quality of service' metrics
-    print(f"{'Metric':<25} | {'Avg ± Std':<15}")
-    print("-" * 50)
-    
-    # TTFT: How fast the hardware responds (Prefill speed)
-    print(f"{'Time to 1st Token (s)':<25} | {np.mean(ttfts):.3f} ± {np.std(ttfts):.3f}")
-    
-    # TPS: How fast the hardware generates (Decoding speed)
-    print(f"{'Tokens Per Second':<25} | {np.mean(tps_list):.2f} ± {np.std(tps_list):.2f}")
-    print("="*50)
+
+    output_summary = f"\n\n{"="*50}\nModel: {model_name}_{output_suffix}\n{"-"*50}\nTokens Per Second: {np.mean(tps_list):.2f} ± {np.std(tps_list):.2f}\n{"="*50}\n"
+    print(output_summary)
+
+    with open(f"output/benchmarks/{model_name_short}/{prefix}_summary.txt", "w") as f:
+        f.write(out_run_str + output_summary)
 
 if __name__ == "__main__":
-    run_vllm_benchmark(prompts)
+    num_gpus_str = "multigpu" if args.multigpu else "single_gpu"
+    if args.vllm:
+        print(f"Benchmarking {num_gpus_str} with vLLM...")
+        run_vllm_benchmark(args.model, prompts)
+    else:
+        print(f"Benchmarking {num_gpus_str} with Mistral functions...")
+        run_mistral_benchmark(args.model, prompts)
+    

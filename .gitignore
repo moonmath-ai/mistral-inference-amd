@@ -161,6 +161,7 @@ cython_debug/
 
 # Our additions
 # Don't save the model as part of the repo
-**/mistral-7B-Instruct-v0.3.tar
+tutorials/*.tar
 *.ipynb
 **/output/
+models/
