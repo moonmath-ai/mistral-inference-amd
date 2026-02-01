@@ -192,7 +192,7 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
     output_summary = f"\n\n{"="*50}\nModel: {model_name}_{output_suffix}\n{"-"*50}\nTokens Per Second: {np.mean(tps_list):.2f} ± {np.std(tps_list):.2f}\n{"="*50}\n"
     print(output_summary)
 
-    with open(f"output/benchmarks/{model_name_short}/{prefix}_summary.txt", "w") as f:
+    with open(f"output/benchmarks/{model_name_short}/{prefix}_summary_{output_suffix}.txt", "w") as f:
         f.write(out_run_str + output_summary)
 
 if __name__ == "__main__":
