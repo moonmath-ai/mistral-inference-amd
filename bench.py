@@ -1,9 +1,12 @@
-import time
-import os
-import numpy as np
-from openai import OpenAI
-import requests
 import argparse
+import cProfile
+import os
+import pstats
+import time
+
+import numpy as np
+import requests
+from openai import OpenAI
 
 from chat import Chat
 
@@ -11,6 +14,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="7b_instruct_v.3")
 parser.add_argument("--vllm", action="store_true")
 parser.add_argument("--multigpu", action="store_true")
+parser.add_argument(
+    "--profile",
+    type=str,
+    choices=("none", "python", "torch", "rocprof"),
+    default="none",
+    help="Profiling mode: none (default), python (cProfile), torch, or rocprof.",
+)
 args = parser.parse_args()
 
 MODEL_FULL_NAMES = {
@@ -201,6 +211,29 @@ if __name__ == "__main__":
         print(f"Benchmarking {num_gpus_str} with vLLM...")
         run_vllm_benchmark(args.model, prompts)
     else:
-        print(f"Benchmarking {num_gpus_str} with Mistral functions...")
-        run_mistral_benchmark(args.model, prompts)
+        if args.profile == "python":
+            print(f"Benchmarking {num_gpus_str} with Mistral functions (Python profiler)...")
+            prof = cProfile.Profile()
+            prof.enable()
+            run_mistral_benchmark(args.model, prompts)
+            prof.disable()
+            model_name_short = MODEL_FULL_NAMES[args.model].split("/")[-1]
+            profile_suffix = "multigpu" if args.multigpu else "single_gpu"
+            prof_dir = f"output/benchmarks/{model_name_short}"
+            os.makedirs(prof_dir, exist_ok=True)
+            prof_path = os.path.join(prof_dir, f"profile_python_{profile_suffix}.prof")
+            txt_path = os.path.join(prof_dir, f"profile_python_{profile_suffix}.txt")
+            prof.dump_stats(prof_path)
+            with open(txt_path, "w") as f:
+                ps = pstats.Stats(prof, stream=f)
+                ps.strip_dirs()
+                f.write("=== By cumulative time (call trees) ===\n\n")
+                ps.sort_stats("cumulative").print_stats()
+                f.write("\n\n=== By self time (leaf / heavy functions only) ===\n\n")
+                ps.sort_stats("time").print_stats()
+            print(f"Python profile saved: {prof_path}")
+            print(f"Python profile summary: {txt_path}")
+        else:
+            print(f"Benchmarking {num_gpus_str} with Mistral functions...")
+            run_mistral_benchmark(args.model, prompts)
     

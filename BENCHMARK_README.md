@@ -3,13 +3,21 @@
 - [bench.py](./bench.py) script for measuring TPS of the model for various prompts, for different serving options.
 - [chat.py](./chat.py) script for directly prompting the MistralAI models, based on examples shown in [the tutorial notebook](./tutorials/getting_started.ipynb) (If the notebook is missing see the [README](./tutorials/README.md) to generate the notebooks from the jupytext script).
 - [vllm_serve.sh](./vllm_serve.sh) - script for launching a vLLM serving of the model.
+- [profile.md](./profile.md) - plan and usage for profiling (Python, PyTorch, ROCm).
 ## Running a benchmark
 `bench.py` receives a few CLI arguments for specific benchmarks:
 - `--model` - model name, fitting one of the keys seen in `MODEL_FULL_NAMES`, default is the base 7B model.
 - `--vllm` - use vLLM for serving and measure its performance, default is to use MistralAI's serving.
 - `--multigpu` - use multiple GPUs for serving and measurement.
+- `--profile` - profiling mode: `none` (default), `python`, `torch`, or `rocprof`. Applies only to the native (Mistral) path; ignored when `--vllm` is set.
 
-The benchmark runs the relevant model serving with a list of prompts seen in the start of the file. Both prompt results and metrics (TPS etc.) are stored in `outputs/<model key name>/<native or vllm>_output_<output number>_<prompt start>__<nof gpus>`, and `outputs/<model key name>/<native or vllm>_summary__<num gpus>`.
+The benchmark runs the relevant model serving with a list of prompts seen in the start of the file. Both prompt results and metrics (TPS etc.) are stored in `output/benchmarks/<model key name>/<native or vllm>_output_<output number>_<prompt start>_<nof gpus>`, and `output/benchmarks/<model key name>/<native or vllm>_summary_<num gpus>`.
+
+### Profiling
+All profiler outputs are written under `output/benchmarks/<model_name_short>/`. See [profile.md](./profile.md) for details.
+- **Python (cProfile):** `python bench.py --model 7b_instruct_v.3 --profile python` → `profile_python_<suffix>.prof` and `profile_python_<suffix>.txt`.
+- **PyTorch:** `python bench.py --model 7b_instruct_v.3 --profile torch` (Phase 2).
+- **ROCm:** `python bench.py --model 7b_instruct_v.3 --profile rocprof` (Phase 3).
 
 ### Mistral / native benchmark
 To check their implementation, only the above `bench.py` must be run. Outputs will be stored in 
