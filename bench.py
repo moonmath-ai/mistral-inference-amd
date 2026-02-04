@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import requests
+import torch
 from openai import OpenAI
 
 from chat import Chat
@@ -233,6 +234,37 @@ if __name__ == "__main__":
                 ps.sort_stats("time").print_stats()
             print(f"Python profile saved: {prof_path}")
             print(f"Python profile summary: {txt_path}")
+        elif args.profile == "torch":
+            print(f"Benchmarking {num_gpus_str} with Mistral functions (PyTorch profiler)...")
+            model_name_short = MODEL_FULL_NAMES[args.model].split("/")[-1]
+            profile_suffix = "multigpu" if args.multigpu else "single_gpu"
+            prof_dir = f"output/benchmarks/{model_name_short}"
+            os.makedirs(prof_dir, exist_ok=True)
+            json_path = os.path.join(prof_dir, f"profile_torch_{profile_suffix}.json")
+            summary_path = os.path.join(prof_dir, f"profile_torch_{profile_suffix}_summary.txt")
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            profile_prompts = prompts[:2]
+            print(f"PyTorch profiler: using {len(profile_prompts)} prompt(s) for smaller trace.\n")
+            with torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=False,
+            ) as prof:
+                run_mistral_benchmark(args.model, profile_prompts)
+            prof.export_chrome_trace(json_path)
+            with open(summary_path, "w") as f:
+                f.write("=== By self CPU time ===\n\n")
+                f.write(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=100))
+                if torch.cuda.is_available():
+                    f.write("\n\n=== By self GPU time ===\n\n")
+                    f.write(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=100))
+                f.write("\n\n=== By input shape (matrix sizes / batching) ===\n\n")
+                f.write(prof.key_averages(group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=150))
+            print(f"PyTorch trace saved: {json_path}")
+            print(f"PyTorch summary saved: {summary_path}")
         else:
             print(f"Benchmarking {num_gpus_str} with Mistral functions...")
             run_mistral_benchmark(args.model, prompts)
