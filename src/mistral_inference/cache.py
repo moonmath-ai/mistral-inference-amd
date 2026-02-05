@@ -220,9 +220,36 @@ class BufferCache:
         seqlens_t = torch.tensor(seqlens, device=dev, dtype=torch.long)
         total_len = seqlens_t.sum().item()
 
-        for cache_size in self.cache_sizes:
+        first_prefill = (self.kv_seqlens[0] == 0).item()
+        subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
+        kv_seqlen_lists: Optional[List[List[int]]] = None
+        if not first_prefill:
+            cache_sizes_t = torch.tensor(self.cache_sizes, device=dev, dtype=torch.long)
+            B = len(seqlens)
+            if subsequent_prefill:
+                kv_clamped = self.kv_seqlens.unsqueeze(0).clamp(max=cache_sizes_t.unsqueeze(1))
+                kv_seqlen_2d = seqlens_t.unsqueeze(0) + kv_clamped
+            else:
+                cached_elements_2d = torch.minimum(
+                    seqlens_t.unsqueeze(0), cache_sizes_t.unsqueeze(1)
+                )
+                kv_seqlen_2d = (
+                    self.kv_seqlens.unsqueeze(0) + cached_elements_2d
+                ).clamp(max=cache_sizes_t.unsqueeze(1))
+            kv_seqlen_lists = kv_seqlen_2d.tolist()
+
+        for layer_idx, cache_size in enumerate(self.cache_sizes):
             metadata.append(
-                self._get_input_metadata_layer(cache_size, seqlens, seqlens_t, total_len, self.kv_seqlens)
+                self._get_input_metadata_layer(
+                    cache_size,
+                    seqlens,
+                    seqlens_t,
+                    total_len,
+                    self.kv_seqlens,
+                    first_prefill,
+                    subsequent_prefill,
+                    kv_seqlen_lists[layer_idx] if kv_seqlen_lists is not None else None,
+                )
             )
 
         return metadata
@@ -234,6 +261,9 @@ class BufferCache:
         seqlens_t: torch.Tensor,
         total_len: int,
         kv_seqlens_tensor: torch.Tensor,
+        first_prefill: bool,
+        subsequent_prefill: bool,
+        kv_seqlen_list_for_layer: Optional[List[int]],
     ) -> CacheInputMetadata:
         dev = self.device
         B = len(seqlens)
@@ -256,23 +286,21 @@ class BufferCache:
         cache_positions = positions % cache_size + batch_idx * cache_size
         cache_positions_masked = cache_positions[to_cache_mask]
 
-        first_prefill = (kv_seqlens_tensor[0] == 0).item()
-        subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
         if first_prefill:
             assert (kv_seqlens_tensor == 0).all().item(), "expected all seqpos == 0 on first prefill"
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(cache_size)
         elif subsequent_prefill:
-            kv_seqlen_list = (seqlens_t + kv_seqlens_tensor.clamp(max=cache_size)).tolist()
+            assert kv_seqlen_list_for_layer is not None
             mask = BlockDiagonalMask.from_seqlens(
                 q_seqlen=seqlens,
-                kv_seqlen=kv_seqlen_list,
+                kv_seqlen=kv_seqlen_list_for_layer,
             ).make_local_attention_from_bottomright(cache_size)
         else:
-            kv_seqlen_list = (kv_seqlens_tensor + cached_elements).clamp(max=cache_size).tolist()
+            assert kv_seqlen_list_for_layer is not None
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=cache_size,
-                kv_seqlen=kv_seqlen_list,
+                kv_seqlen=kv_seqlen_list_for_layer,
             )
         return CacheInputMetadata(
             positions=positions,

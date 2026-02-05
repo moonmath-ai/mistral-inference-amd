@@ -37,7 +37,7 @@ class Chat(metaclass=ChatMeta):
         self._model_name = model_path
         print(f"Chat instance created for model: {model_path}")
 
-    def __call__(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
+    def __call__(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0, return_logprobs: bool = True) -> str:
         completion_request = ChatCompletionRequest(messages=[UserMessage(content=prompt)])
         tokens = self._tokenizer.encode_chat_completion(completion_request).tokens
         generated_tokens, _ = generate(
@@ -45,7 +45,8 @@ class Chat(metaclass=ChatMeta):
             model=self._model,
             max_tokens=max_tokens,
             temperature=temperature,
-            eos_id=self._tokenizer.instruct_tokenizer.tokenizer.eos_id
+            eos_id=self._tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            return_logprobs=return_logprobs,
         )
         nof_tokens = len(generated_tokens[0])
         return self._tokenizer.instruct_tokenizer.tokenizer.decode(generated_tokens[0]), nof_tokens

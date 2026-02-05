@@ -182,6 +182,52 @@ Improve inference throughput for Mistral 7B and 8×7B on single AMD MI300X by ke
 
 ---
 
+## Why HtoD dropped but total time only slightly
+
+After Phase 1–3, profiling showed **Memcpy HtoD** share of GPU time dropping from ~71% to ~48%, but TPS improved only modestly (~2%). Reason:
+
+1. **HtoD is a share of GPU time, not wall time**  
+   Wall time = CPU work + sync points + GPU work. The profiler’s “%” is of *self GPU time*. Reducing GPU copy time doesn’t reduce wall time 1:1 if the **critical path** is elsewhere.
+
+2. **Copies can overlap; syncs cannot**  
+   Much HtoD is asynchronous (copy and compute overlap). So we removed copy *work*, but the limiting factor for latency is often **synchronization**: every `.tolist()` or `.item()` blocks the CPU until the GPU has finished up to that point. We still do **32 `.tolist()` per forward** (one per layer for xformers mask APIs), so the pipeline keeps stalling on those syncs.
+
+3. **Critical path**  
+   Total time is dominated by **kernel execution + sync points**, not by the HtoD we removed. To reduce total time further, we need to **reduce or batch sync points**, not only copies.
+
+---
+
+## Next phase: reduce sync points (lower total time)
+
+Goal: fewer GPU→CPU syncs in the hot path so the critical path shortens and TPS can increase.
+
+### 4.1 cache.py: minimize `.tolist()` for masks — **done**
+
+- **Implemented:** In `get_input_metadata`, we now build a single 2D tensor `(n_layers, B)` for `kv_seqlen` (subsequent_prefill or decode), call **one** `.tolist()` per forward, and pass `kv_seqlen_lists[layer_idx]` into `_get_input_metadata_layer`. So there is **one GPU→CPU sync per forward** for masks instead of 32. xformers APIs still receive Python lists per layer; the sync is batched.
+
+### 4.2 cache.py: avoid redundant `.item()` / syncs
+
+- We still have `total_len = seqlens_t.sum().item()` once per forward (acceptable).
+- `first_prefill = (kv_seqlens_tensor[0] == 0).item()` — one `.item()` per forward; keep unless we can express the branch without a sync.
+- No other per-layer `.item()` in the hot path after Phase 1–3.
+
+### 4.3 generate.py: logprobs — **done (no-logprobs path)**
+
+- **Implemented:** `generate(..., return_logprobs=True)` is the default. When `return_logprobs=False`, we skip all logprob `.item()` calls in the prefill chunk pass and in the decode loop. `Chat.__call__(..., return_logprobs=True)` passes through to `generate`; the benchmark uses `return_logprobs=False` for maximum TPS.
+- If logprobs are required in the future: **batch** — accumulate on device and do one transfer per step or per request instead of one `.item()` per token per sequence.
+
+### 4.4 Profile sync cost
+
+- In the PyTorch trace (Chrome/Perfetto), look for **gaps** between GPU work and CPU work: those are sync stalls. Correlate with `.tolist()` / `.item()` call sites.
+- Optional: add small timing blocks in code around `get_input_metadata` and mask construction to see how much wall time is spent in the sync path.
+
+### Validation
+
+- Re-run `bench.py --model 7b_instruct_v.3` (and 8×7B); compare TPS to reference and to Phase 1–3 results.
+- Re-run `--profile torch` and confirm Memcpy HtoD share stays low and that no new heavy syncs appear in the trace.
+
+---
+
 ## Summary
 
 | Area            | Change                                              | Phase |
@@ -192,5 +238,10 @@ Improve inference throughput for Mistral 7B and 8×7B on single AMD MI300X by ke
 | cache.py        | to_cache_mask, cached_elements built on device      | 2     |
 | generate.py     | batched logprob transfer if needed                  | 3     |
 | transformer.py | SimpleInputMetadata positions on device             | 3     |
+| cache.py        | seqlens_t/total_len once per forward (no per-layer) | done  |
+| cache.py        | one .tolist() per forward for mask kv_seqlen        | 4 done |
+| generate.py     | optional no-logprobs path (bench uses it)           | 4 done |
+| generate.py     | batch logprob transfer if needed later             | 4     |
+| —               | profile sync cost in trace                          | 4     |
 
-Goal: keep tensors on device for 7B/8×7B on MI300X, remove redundant copies and CPU syncs, and measure with `bench.py` and the PyTorch profiler.
+Goal: keep tensors on device for 7B/8×7B on MI300X, remove redundant copies and CPU syncs, then reduce sync points so the critical path shortens and total time (TPS) improves. Measure with `bench.py` and the PyTorch profiler.

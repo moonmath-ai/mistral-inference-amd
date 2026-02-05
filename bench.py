@@ -171,13 +171,13 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
     warmup_prompt = "Write a haiku about a cat that walks on his head."
 
     print(f"Warming up model... ({warmup_prompt[:20]}...)")
-    response, nof_tokens = chat(warmup_prompt)
+    response, nof_tokens = chat(warmup_prompt, return_logprobs=False)
     print(f"Warmed up model - response:\n{response}\n\n")
 
     for i, prompt in enumerate(prompt_list):
         start_time = time.perf_counter()
         
-        response, nof_tokens = chat(prompt)
+        response, nof_tokens = chat(prompt, return_logprobs=False)
         
         end_time = time.perf_counter()
         latency = end_time - start_time

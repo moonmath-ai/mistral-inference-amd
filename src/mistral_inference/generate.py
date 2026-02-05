@@ -50,6 +50,7 @@ def generate(
     temperature: float,
     chunk_size: Optional[int] = None,
     eos_id: Optional[int] = None,
+    return_logprobs: bool = True,
 ) -> Tuple[List[List[int]], List[List[float]]]:
     images_torch: List[List[torch.Tensor]] = []
     if images:
@@ -77,7 +78,7 @@ def generate(
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
 
-    # Bookkeeping
+    # Bookkeeping (always allocate so return type is consistent; only fill when return_logprobs)
     logprobs: List[List[float]] = [[] for _ in range(B)]
     last_token_prelogits = None
 
@@ -100,16 +101,17 @@ def generate(
         )
         logits = torch.log_softmax(prelogits, dim=-1)
 
-        if last_token_prelogits is not None:
+        if last_token_prelogits is not None and return_logprobs:
             # Pass > 1
             last_token_logits = torch.log_softmax(last_token_prelogits, dim=-1)
             for i_seq in range(B):
                 logprobs[i_seq].append(last_token_logits[i_seq, prompt_chunks[i_seq][0]].item())
 
-        offset = 0
-        for i_seq, sequence in enumerate(prompt_chunks):
-            logprobs[i_seq].extend([logits[offset + i, sequence[i + 1]].item() for i in range(len(sequence) - 1)])
-            offset += len(sequence)
+        if return_logprobs:
+            offset = 0
+            for i_seq, sequence in enumerate(prompt_chunks):
+                logprobs[i_seq].extend([logits[offset + i, sequence[i + 1]].item() for i in range(len(sequence) - 1)])
+                offset += len(sequence)
 
         last_token_prelogits = prelogits.index_select(
             0,
@@ -131,9 +133,10 @@ def generate(
         if is_finished.all():
             break
 
-        last_token_logits = torch.log_softmax(last_token_prelogits, dim=-1)
-        for i in range(B):
-            logprobs[i].append(last_token_logits[i, next_token[i]].item())
+        if return_logprobs:
+            last_token_logits = torch.log_softmax(last_token_prelogits, dim=-1)
+            for i in range(B):
+                logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tensors.append(next_token[:, None])
         last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
