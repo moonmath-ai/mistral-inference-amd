@@ -119,14 +119,14 @@ def generate(
 
     # decode
     generated_tensors = []
-    is_finished = torch.tensor([False for _ in range(B)])
+    is_finished = torch.zeros(B, dtype=torch.bool, device=last_token_prelogits.device)
 
     assert last_token_prelogits is not None
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
 
         if eos_id is not None:
-            is_finished = is_finished | (next_token == eos_id).cpu()
+            is_finished = is_finished | (next_token == eos_id)
 
         if is_finished.all():
             break

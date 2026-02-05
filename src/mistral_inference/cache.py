@@ -214,49 +214,71 @@ class BufferCache:
         assert len(seqlens) == len(
             self.kv_seqlens
         ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
-        seqpos = self.kv_seqlens.tolist()
         assert len(seqlens) > 0, seqlens
 
+        dev = self.device
+        seqlens_t = torch.tensor(seqlens, device=dev, dtype=torch.long)
+        total_len = seqlens_t.sum().item()
+
         for cache_size in self.cache_sizes:
-            metadata.append(self._get_input_metadata_layer(cache_size, seqlens, seqpos))
+            metadata.append(
+                self._get_input_metadata_layer(cache_size, seqlens, seqlens_t, total_len, self.kv_seqlens)
+            )
 
         return metadata
 
-    def _get_input_metadata_layer(self, cache_size: int, seqlens: List[int], seqpos: List[int]) -> CacheInputMetadata:
-        masks = [[x >= seqlen - cache_size for x in range(seqlen)] for seqlen in seqlens]
-        to_cache_mask = torch.tensor(sum(masks, []), device=self.device, dtype=torch.bool)
-        cached_elements = torch.tensor([sum(mask) for mask in masks], device=self.device, dtype=torch.long)
-        positions = torch.cat([torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]).to(
-            device=self.device, dtype=torch.long
+    def _get_input_metadata_layer(
+        self,
+        cache_size: int,
+        seqlens: List[int],
+        seqlens_t: torch.Tensor,
+        total_len: int,
+        kv_seqlens_tensor: torch.Tensor,
+    ) -> CacheInputMetadata:
+        dev = self.device
+        B = len(seqlens)
+
+        segment_offsets = torch.cat(
+            [torch.zeros(1, device=dev, dtype=torch.long), torch.cumsum(seqlens_t, 0)[:-1]]
         )
-        batch_idx = torch.tensor(
-            sum([[i] * seqlen for i, seqlen in enumerate(seqlens)], []), device=self.device, dtype=torch.long
+        segment_start_per_token = segment_offsets.repeat_interleave(seqlens_t)
+        positions = kv_seqlens_tensor.repeat_interleave(seqlens_t) + (
+            torch.arange(total_len, device=dev, dtype=torch.long) - segment_start_per_token
         )
+
+        threshold_per_token = (seqlens_t.repeat_interleave(seqlens_t) - cache_size).clamp(min=0)
+        local_pos = torch.arange(total_len, device=dev, dtype=torch.long) - segment_start_per_token
+        to_cache_mask = local_pos >= threshold_per_token
+
+        cached_elements = torch.minimum(seqlens_t, torch.tensor(cache_size, device=dev, dtype=torch.long))
+
+        batch_idx = torch.arange(B, device=dev, dtype=torch.long).repeat_interleave(seqlens_t)
         cache_positions = positions % cache_size + batch_idx * cache_size
-        first_prefill = seqpos[0] == 0
+        cache_positions_masked = cache_positions[to_cache_mask]
+
+        first_prefill = (kv_seqlens_tensor[0] == 0).item()
         subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
         if first_prefill:
-            assert all([pos == 0 for pos in seqpos]), seqpos
+            assert (kv_seqlens_tensor == 0).all().item(), "expected all seqpos == 0 on first prefill"
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(cache_size)
         elif subsequent_prefill:
-            assert self.kv_seqlens is not None
+            kv_seqlen_list = (seqlens_t + kv_seqlens_tensor.clamp(max=cache_size)).tolist()
             mask = BlockDiagonalMask.from_seqlens(
                 q_seqlen=seqlens,
-                kv_seqlen=[
-                    s + cached_s.clamp(max=cache_size).item() for (s, cached_s) in zip(seqlens, self.kv_seqlens)
-                ],
+                kv_seqlen=kv_seqlen_list,
             ).make_local_attention_from_bottomright(cache_size)
         else:
+            kv_seqlen_list = (kv_seqlens_tensor + cached_elements).clamp(max=cache_size).tolist()
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=cache_size,
-                kv_seqlen=(self.kv_seqlens + cached_elements).clamp(max=cache_size).tolist(),
+                kv_seqlen=kv_seqlen_list,
             )
         return CacheInputMetadata(
             positions=positions,
             to_cache_mask=to_cache_mask,
             cached_elements=cached_elements,
-            cache_positions=cache_positions[to_cache_mask],
+            cache_positions=cache_positions_masked,
             prefill=first_prefill or subsequent_prefill,
             mask=mask,
             seqlens=seqlens,

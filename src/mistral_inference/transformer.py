@@ -25,9 +25,10 @@ class SimpleInputMetadata:
 
     @staticmethod
     def from_seqlens(seqlens: List[int], device: torch.device) -> "SimpleInputMetadata":
-        return SimpleInputMetadata(
-            positions=torch.cat([torch.arange(0, seqlen) for seqlen in seqlens]).to(device=device, dtype=torch.long)
+        positions = torch.cat(
+            [torch.arange(0, seqlen, device=device, dtype=torch.long) for seqlen in seqlens]
         )
+        return SimpleInputMetadata(positions=positions)
 
 
 class Transformer(ModelBase, LoRALoaderMixin):
