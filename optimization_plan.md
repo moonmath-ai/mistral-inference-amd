@@ -228,6 +228,60 @@ Goal: fewer GPU→CPU syncs in the hot path so the critical path shortens and TP
 
 ---
 
+## Plan: make decode capture-safe (for HIP/CUDA graphs)
+
+Goal: so that one decode step can be captured in a HIP/CUDA graph and replayed in a loop with no CPU–GPU sync inside the captured region.
+
+**Syncs in the decode path today (all inside `cache.get_input_metadata([1]*B)` called from `forward_partial`):**
+
+1. `first_prefill = (self.kv_seqlens[0] == 0).item()` — one per forward  
+2. `total_len = seqlens_t.sum().item()` — for decode always `B`  
+3. `kv_seqlen_2d.tolist()` — one per forward; result used to build xformers masks  
+4. In `_get_input_metadata_layer`, decode uses `BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(..., kv_seqlen=kv_seqlen_list_for_layer)` — requires a Python list.
+
+**Phase 5.1 – Refactor: optional precomputed metadata**
+
+- Add an optional argument to the transformer forward (e.g. `forward_partial(..., input_metadata: Optional[List[CacheInputMetadata]] = None)`).
+- When `input_metadata` is not None, do **not** call `cache.get_input_metadata(seqlens)`; use the provided list instead.
+- Decode in `generate.py` can then call `cache.get_input_metadata([1]*B)` once per step **before** calling the model, and pass the result into `model.forward(..., input_metadata=metadata)`.
+- **Effect:** All syncs move to the caller; the forward body becomes sync-free when metadata is provided. Graph capture still cannot include the caller’s `get_input_metadata` (it syncs), but the **forward** can be captured.
+
+**Phase 5.2 – Decode metadata with no `.item()`**
+
+- For the decode case (`seqlens == [1]*B`), the caller can pass known values so that `get_input_metadata` does not need to sync for them when we later add a “decode-only” path:
+  - `first_prefill=False`, `total_len=B` (no `.item()`).
+- Optionally add `cache.get_input_metadata_decode(B)` that assumes `seqlens=[1]*B`, uses `first_prefill=False` and `total_len=B`, and only does the single `kv_seqlen_2d.tolist()` and mask construction. Keeps one sync per step, but only one and outside the forward.
+
+**Phase 5.3 – Persistent metadata buffers for graph replay — done**
+
+- **Implemented:** `DecodeMetadataBuffers` in cache.py holds persistent device buffers `(n_layers, max_batch_size)` for positions, to_cache_mask, cached_elements, cache_positions. `update_from_metadata(metadata, B)` copies in; `get_metadata_list(B, source_metadata, seqlens)` returns metadata that uses buffer views (same storage every step). generate.py creates decode_buffers and uses them in the decode loop.
+- The mask is still taken from `source_metadata` (rebuilt each step); for graph replay the mask must be buffer-backed (5.5).
+
+**Phase 5.4 – Single sync before replay (Option A)**
+
+- Flow per decode step: (1) Sync: get `kv_seqlens` (or `kv_seqlen` list) to CPU; build mask(s) and metadata. (2) Copy new metadata tensors into the persistent buffers. (3) Replay the graph.
+- The graph contains only the forward (embedding → layers → norm → output); no sync inside. One sync per step remains, but it is **outside** the graph, so launch overhead and kernel sequence are still improved.
+
+**Phase 5.5 – Zero sync in the hot path (Option B) — partial**
+
+- **Done:** `_decode_mask_tensor` builds mask on device (no sync); mask matches xformers materialized; K/V padded to `k_padded` in attention when using tensor mask so CK gets `stride(-2) % 8 == 0`. **WIP:** On some backends (e.g. xformers CK with padded K/V) decode forward can produce NaN; default remains `use_tensor_mask=False`.
+- Implement or use a decode attention path that does **not** use `BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(..., kv_seqlen=list)`. For example:
+  - Use a single attention mask tensor (e.g. `[1, 1, B, cache_size]`) built on device from `kv_seqlens` and `cache_size` (tensor ops only), and an attention API that accepts it; or
+  - Propose/extend xformers to accept a device tensor for `kv_seqlen` in the decode case.
+- Then `get_input_metadata_decode` (or equivalent) can be fully device-side: no `.item()`, no `.tolist()`. Call it inside the captured region or from a small “metadata kernel” that runs just before the rest of the graph; either way, no CPU sync in the decode step.
+
+**Phase 5.6 – Integrate `torch.cuda.CUDAGraph` (HIP graphs on ROCm) — done (capture only)**
+
+- **Implemented:** `generate(..., use_cuda_graph=False)`. When True, we allocate a static stream and `next_token_buf`, and on the first decode step we try to capture one forward in a CUDAGraph. On ROCm, capture can raise (e.g. `hipErrorStreamCaptureUnsupported` for `index_copy_`); we catch and continue without graph. Replay is not used until the mask is buffer-backed (5.5).
+- Sampling and `is_finished` stay on CPU; we always run `model.forward(...)` each step (no replay yet).
+
+**Validation**
+
+- Run with and without graph capture; compare TPS and output parity.
+- Confirm in the profiler that there are no syncs (e.g. no `aten::item` / `_local_scalar_dense`) inside the captured decode step when using Option B, or one sync per step before replay when using Option A.
+
+---
+
 ## Summary
 
 | Area            | Change                                              | Phase |
@@ -243,5 +297,9 @@ Goal: fewer GPU→CPU syncs in the hot path so the critical path shortens and TP
 | generate.py     | optional no-logprobs path (bench uses it)           | 4 done |
 | generate.py     | batch logprob transfer if needed later             | 4     |
 | —               | profile sync cost in trace                          | 4     |
+| transformer/cache | optional input_metadata; decode metadata no .item() | 5 done |
+| cache            | DecodeMetadataBuffers persistent buffers            | 5.3 done |
+| generate.py     | torch.cuda.CUDAGraph capture (replay needs 5.5)     | 5.6 done |
+| cache            | decode tensor mask (_decode_mask_tensor); gated by use_tensor_mask (default False, WIP) | 5.5 partial |
 
 Goal: keep tensors on device for 7B/8×7B on MI300X, remove redundant copies and CPU syncs, then reduce sync points so the critical path shortens and total time (TPS) improves. Measure with `bench.py` and the PyTorch profiler.

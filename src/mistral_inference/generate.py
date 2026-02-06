@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
-from mistral_inference.cache import BufferCache
+from mistral_inference.cache import BufferCache, DecodeMetadataBuffers
 from mistral_inference.mamba import Mamba
 from mistral_inference.transformer import Transformer
 
@@ -51,6 +51,8 @@ def generate(
     chunk_size: Optional[int] = None,
     eos_id: Optional[int] = None,
     return_logprobs: bool = True,
+    use_cuda_graph: bool = False,
+    use_tensor_mask: bool = False,
 ) -> Tuple[List[List[int]], List[List[float]]]:
     images_torch: List[List[torch.Tensor]] = []
     if images:
@@ -77,6 +79,11 @@ def generate(
     )
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
+
+    # Persistent buffers for decode (Phase 5.3); same storage every step for future graph replay.
+    decode_buffers = DecodeMetadataBuffers(
+        model.n_local_layers, model.args.max_batch_size, model.device
+    )
 
     # Bookkeeping (always allocate so return type is consistent; only fill when return_logprobs)
     logprobs: List[List[float]] = [[] for _ in range(B)]
@@ -123,8 +130,16 @@ def generate(
     generated_tensors = []
     is_finished = torch.zeros(B, dtype=torch.bool, device=last_token_prelogits.device)
 
+    # Optional CUDAGraph (5.6): capture one step for replay. Replay requires tensor mask (5.5).
+    static_stream: Optional[torch.cuda.Stream] = None
+    graph: Optional[torch.cuda.CUDAGraph] = None
+    next_token_buf: Optional[torch.Tensor] = None
+    if use_cuda_graph and torch.cuda.is_available():
+        static_stream = torch.cuda.Stream()
+        next_token_buf = torch.empty((B,), dtype=torch.long, device=model.device)
+
     assert last_token_prelogits is not None
-    for _ in range(max_tokens):
+    for step in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
 
         if eos_id is not None:
@@ -139,7 +154,29 @@ def generate(
                 logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+
+        # Decode path: use_tensor_mask=True avoids .tolist() sync (5.5); default keeps list mask for correctness.
+        decode_metadata = cache.get_input_metadata_decode(B, use_tensor_mask=use_tensor_mask)
+        decode_buffers.update_from_metadata(decode_metadata, B)
+        metadata_for_forward = decode_buffers.get_metadata_list(B, decode_metadata, [1] * B)
+
+        if use_cuda_graph and static_stream is not None and next_token_buf is not None and graph is None and step == 0:
+            # Capture one decode step (5.6). Replay not used until mask is buffer-backed (5.5).
+            # On ROCm, capture may fail (e.g. hipErrorStreamCaptureUnsupported); then we skip.
+            try:
+                next_token_buf.copy_(next_token)
+                _graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(_graph, stream=static_stream):
+                    _ = model.forward(
+                        next_token_buf, seqlens=[1] * B, cache=cache, input_metadata=metadata_for_forward
+                    )
+                graph = _graph
+            except RuntimeError:
+                graph = None  # e.g. ROCm stream capture not supported for some ops
+
+        last_token_prelogits = model.forward(
+            next_token, seqlens=[1] * B, cache=cache, input_metadata=metadata_for_forward
+        )
         assert last_token_prelogits.shape == (B, V)
 
     generated_tokens: List[List[int]]

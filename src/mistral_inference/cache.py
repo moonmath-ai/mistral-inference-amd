@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 from xformers.ops.fmha.attn_bias import (  # type: ignore
@@ -45,10 +45,87 @@ class CacheInputMetadata:
     # where tokens should go in the cache
     cache_positions: torch.Tensor
     # if prefill, use block diagonal causal mask
-    # else use causal with padded key mask
+    # else use causal with padded key mask (or tensor for decode, Phase 5.5)
     prefill: bool
-    mask: AttentionBias
+    mask: Union[AttentionBias, torch.Tensor]
     seqlens: List[int]
+
+
+class DecodeMetadataBuffers:
+    """
+    Persistent device buffers for decode metadata (Phase 5.3).
+    Same storage every step so graph replay can read updated values.
+    """
+
+    def __init__(self, n_layers: int, max_batch_size: int, device: torch.device) -> None:
+        self.n_layers = n_layers
+        self.max_batch_size = max_batch_size
+        self.device = device
+        self.positions_buf = torch.empty(
+            (n_layers, max_batch_size), device=device, dtype=torch.long
+        )
+        self.to_cache_mask_buf = torch.empty(
+            (n_layers, max_batch_size), device=device, dtype=torch.bool
+        )
+        self.cached_elements_buf = torch.empty(
+            (n_layers, max_batch_size), device=device, dtype=torch.long
+        )
+        self.cache_positions_buf = torch.empty(
+            (n_layers, max_batch_size), device=device, dtype=torch.long
+        )
+
+    def update_from_metadata(self, metadata: List[CacheInputMetadata], B: int) -> None:
+        """Copy tensor fields from metadata into persistent buffers."""
+        assert len(metadata) == self.n_layers and B <= self.max_batch_size
+        for i, m in enumerate(metadata):
+            self.positions_buf[i, :B].copy_(m.positions)
+            self.to_cache_mask_buf[i, :B].copy_(m.to_cache_mask)
+            self.cached_elements_buf[i, :B].copy_(m.cached_elements)
+            self.cache_positions_buf[i, :B].copy_(m.cache_positions)
+
+    def get_metadata_list(
+        self, B: int, source_metadata: List[CacheInputMetadata], seqlens: List[int]
+    ) -> List[CacheInputMetadata]:
+        """Return CacheInputMetadata list that uses buffer views; masks from source_metadata."""
+        assert len(source_metadata) == self.n_layers and B <= self.max_batch_size
+        out: List[CacheInputMetadata] = []
+        for i in range(self.n_layers):
+            m = source_metadata[i]
+            out.append(
+                CacheInputMetadata(
+                    positions=self.positions_buf[i, :B],
+                    to_cache_mask=self.to_cache_mask_buf[i, :B],
+                    cached_elements=self.cached_elements_buf[i, :B],
+                    cache_positions=self.cache_positions_buf[i, :B],
+                    prefill=m.prefill,
+                    mask=m.mask,
+                    seqlens=seqlens,
+                )
+            )
+        return out
+
+
+def _decode_mask_tensor(
+    device: torch.device,
+    B: int,
+    cache_size: int,
+    kv_seqlen_for_layer: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build (1, 1, B, k_padded) mask for decode: 0.0 valid, -inf elsewhere. No sync.
+    Returns full k_padded so CK kernel gets stride(-2) % 8 == 0; attention layer must pad K/V to k_padded."""
+    total_k = B * cache_size
+    k_padded = (total_k + 7) // 8 * 8
+    offset = torch.arange(B, device=device, dtype=torch.long) * cache_size
+    valid_end = offset + kv_seqlen_for_layer
+    k = torch.arange(total_k, device=device)
+    mask_valid = (k.unsqueeze(0) >= offset.unsqueeze(1)) & (k.unsqueeze(0) < valid_end.unsqueeze(1))
+    mask_padded = torch.zeros(1, 1, B, k_padded, device=device, dtype=torch.bool)
+    mask_padded[:, :, :, :total_k] = mask_valid.unsqueeze(0).unsqueeze(0)
+    neg_inf = torch.finfo(dtype).min if dtype.is_floating_point else float("-inf")
+    out = torch.zeros(1, 1, B, k_padded, device=device, dtype=dtype)
+    out.masked_fill_(~mask_padded, neg_inf)
+    return out
 
 
 def interleave_list(l1: List[torch.Tensor], l2: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -254,6 +331,48 @@ class BufferCache:
 
         return metadata
 
+    def get_input_metadata_decode(
+        self, B: int, use_tensor_mask: bool = False
+    ) -> List[CacheInputMetadata]:
+        """Decode step: seqlens = [1]*B. use_tensor_mask=False (default): one .tolist() sync, correct output.
+        use_tensor_mask=True: no sync (Phase 5.5); mask matches xformers materialized, but on some backends
+        (e.g. xformers CK with padded K/V) the attention output can be NaN; keep default for correctness."""
+        assert self.kv_seqlens is not None, "cache not initialized"
+        assert len(self.kv_seqlens) == B, (len(self.kv_seqlens), B)
+        dev = self.device
+        seqlens = [1] * B
+        seqlens_t = torch.ones(B, device=dev, dtype=torch.long)
+        total_len = B
+        first_prefill = False
+        subsequent_prefill = False
+        cache_sizes_t = torch.tensor(self.cache_sizes, device=dev, dtype=torch.long)
+        cached_elements_2d = torch.minimum(
+            seqlens_t.unsqueeze(0), cache_sizes_t.unsqueeze(1)
+        )
+        kv_seqlen_2d = (
+            self.kv_seqlens.unsqueeze(0) + cached_elements_2d
+        ).clamp(max=cache_sizes_t.unsqueeze(1))
+        if use_tensor_mask:
+            kv_seqlen_lists = None
+        else:
+            kv_seqlen_lists = kv_seqlen_2d.tolist()
+        metadata: List[CacheInputMetadata] = []
+        for layer_idx, cache_size in enumerate(self.cache_sizes):
+            metadata.append(
+                self._get_input_metadata_layer(
+                    cache_size,
+                    seqlens,
+                    seqlens_t,
+                    total_len,
+                    self.kv_seqlens,
+                    first_prefill,
+                    subsequent_prefill,
+                    kv_seqlen_list_for_layer=kv_seqlen_lists[layer_idx] if kv_seqlen_lists is not None else None,
+                    kv_seqlen_for_layer_tensor=kv_seqlen_2d[layer_idx] if use_tensor_mask else None,
+                )
+            )
+        return metadata
+
     def _get_input_metadata_layer(
         self,
         cache_size: int,
@@ -264,6 +383,7 @@ class BufferCache:
         first_prefill: bool,
         subsequent_prefill: bool,
         kv_seqlen_list_for_layer: Optional[List[int]],
+        kv_seqlen_for_layer_tensor: Optional[torch.Tensor] = None,
     ) -> CacheInputMetadata:
         dev = self.device
         B = len(seqlens)
@@ -295,6 +415,11 @@ class BufferCache:
                 q_seqlen=seqlens,
                 kv_seqlen=kv_seqlen_list_for_layer,
             ).make_local_attention_from_bottomright(cache_size)
+        elif kv_seqlen_for_layer_tensor is not None:
+            # Decode with tensor mask (Phase 5.5): no .tolist(), no sync.
+            mask = _decode_mask_tensor(
+                dev, B, cache_size, kv_seqlen_for_layer_tensor, dtype=self.cache_k[0].dtype
+            )
         else:
             assert kv_seqlen_list_for_layer is not None
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(

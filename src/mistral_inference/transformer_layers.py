@@ -85,7 +85,17 @@ class Attention(nn.Module):
 
         # xformers requires (B=1, S, H, D)
         xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(xq, key, val, mask if cache is None else cache.mask)
+        attn_mask = mask if cache is None else cache.mask
+        # Decode tensor mask is (1, 1, B, k_padded); pad K/V to k_padded so CK gets stride(-2) % 8 == 0.
+        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 4 and attn_mask.size(1) == 1:
+            k_padded = attn_mask.size(-1)
+            if key.size(1) < k_padded:
+                pad_len = k_padded - key.size(1)
+                # Pad seq dim (dim 1): (dim3, dim2, dim1, dim0) = (0,0, 0,0, 0,pad_len, 0,0)
+                key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, pad_len, 0, 0))
+                val = torch.nn.functional.pad(val, (0, 0, 0, 0, 0, pad_len, 0, 0))
+            attn_mask = attn_mask.expand(1, self.n_heads, -1, -1)
+        output = memory_efficient_attention(xq, key, val, attn_mask)
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
         assert isinstance(output, torch.Tensor)

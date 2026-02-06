@@ -167,11 +167,15 @@ class Transformer(ModelBase, LoRALoaderMixin):
         seqlens: List[int],
         cache: Optional[BufferCache] = None,
         images: Optional[List[torch.Tensor]] = None,
+        input_metadata: Optional[List[CacheInputMetadata]] = None,
     ) -> torch.Tensor:
         """Local forward pass.
 
         If doing pipeline parallelism, this will return the activations of the last layer of this stage.
         For the last stage, this will return the normalized final embeddings.
+
+        When cache is not None, input_metadata can be provided to avoid calling cache.get_input_metadata
+        inside this forward (e.g. for graph capture: sync happens in the caller).
         """
         assert len(seqlens) <= self.args.max_batch_size, (
             f"Max batch size is {self.args.max_batch_size}, got batch size of {len(seqlens)}"
@@ -179,12 +183,15 @@ class Transformer(ModelBase, LoRALoaderMixin):
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
 
-        input_metadata: List[CacheInputMetadata] | List[SimpleInputMetadata]
+        input_metadata_list: List[CacheInputMetadata] | List[SimpleInputMetadata]
 
         if cache is not None:
-            input_metadata = cache.get_input_metadata(seqlens)
+            if input_metadata is not None:
+                input_metadata_list = input_metadata
+            else:
+                input_metadata_list = cache.get_input_metadata(seqlens)
         else:
-            input_metadata = [SimpleInputMetadata.from_seqlens(seqlens, self.device) for _ in range(len(self.layers))]
+            input_metadata_list = [SimpleInputMetadata.from_seqlens(seqlens, self.device) for _ in range(len(self.layers))]
 
         if self.pipeline_rank == 0:
             assert self.tok_embeddings is not None
@@ -197,12 +204,12 @@ class Transformer(ModelBase, LoRALoaderMixin):
             torch.distributed.recv(h, src=self.pipeline_rank - 1)
 
         # freqs_cis is always the same for every layer
-        freqs_cis = self.freqs_cis[input_metadata[0].positions]
+        freqs_cis = self.freqs_cis[input_metadata_list[0].positions]
 
         for local_layer_id, layer in enumerate(self.layers.values()):
             if cache is not None:
-                assert input_metadata is not None
-                cache_metadata = input_metadata[local_layer_id]
+                assert input_metadata_list is not None
+                cache_metadata = input_metadata_list[local_layer_id]
                 assert isinstance(cache_metadata, CacheInputMetadata)
                 cache_view = cache.get_view(local_layer_id, cache_metadata)
             else:
@@ -225,8 +232,9 @@ class Transformer(ModelBase, LoRALoaderMixin):
         seqlens: List[int],
         cache: Optional[BufferCache] = None,
         images: Optional[List[torch.Tensor]] = None,
+        input_metadata: Optional[List[CacheInputMetadata]] = None,
     ) -> torch.Tensor:
-        h = self.forward_partial(input_ids, seqlens, cache=cache, images=images)
+        h = self.forward_partial(input_ids, seqlens, cache=cache, images=images, input_metadata=input_metadata)
         if self.pipeline_rank < self.num_pipeline_ranks - 1:
             # ignore the intermediate activations as we'll get the final output from
             # the last stage
