@@ -5,6 +5,7 @@ from pathlib import Path
 
 from mistral_inference.transformer import Transformer
 from mistral_inference.generate import generate
+from mistral_inference.timing import StageTiming
 
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from mistral_common.protocol.instruct.messages import UserMessage
@@ -12,7 +13,8 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
 import threading
 
-from typing import Dict
+from time import perf_counter
+from typing import Dict, Optional, Tuple, Union
 
 class ChatMeta(type):
     _instances = {}
@@ -37,18 +39,29 @@ class Chat(metaclass=ChatMeta):
         self._model_name = model_path
         print(f"Chat instance created for model: {model_path}")
 
-    def __call__(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
+    def __call__(
+        self, prompt: str, max_tokens: int = 512, temperature: float = 0.0, return_timing: bool = False
+    ) -> Union[Tuple[str, int], Tuple[str, int, StageTiming]]:
+        timing: Optional[StageTiming] = StageTiming() if return_timing else None
         completion_request = ChatCompletionRequest(messages=[UserMessage(content=prompt)])
+        tok_start = perf_counter()
         tokens = self._tokenizer.encode_chat_completion(completion_request).tokens
+        tok_end = perf_counter()
+        if timing is not None:
+            timing.tokenization_ms = (tok_end - tok_start) * 1000.0
         generated_tokens, _ = generate(
             encoded_prompts=[tokens],
             model=self._model,
             max_tokens=max_tokens,
             temperature=temperature,
-            eos_id=self._tokenizer.instruct_tokenizer.tokenizer.eos_id
+            eos_id=self._tokenizer.instruct_tokenizer.tokenizer.eos_id,
+            timing=timing,
         )
         nof_tokens = len(generated_tokens[0])
-        return self._tokenizer.instruct_tokenizer.tokenizer.decode(generated_tokens[0]), nof_tokens
+        decoded = self._tokenizer.instruct_tokenizer.tokenizer.decode(generated_tokens[0])
+        if timing is not None:
+            return decoded, nof_tokens, timing
+        return decoded, nof_tokens
 
 if __name__ == "__main__":
     chat = Chat("mistral_7b_instruct_v3")

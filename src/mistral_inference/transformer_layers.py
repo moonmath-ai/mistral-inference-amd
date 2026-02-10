@@ -11,6 +11,7 @@ from mistral_inference.cache import CacheView
 from mistral_inference.lora import LoRALinear
 from mistral_inference.moe import MoeArgs, MoeLayer
 from mistral_inference.rope import apply_rotary_emb
+from mistral_inference.timing import get_current_phase, get_current_timing, measure_gpu_ms_if_available
 
 
 def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -85,7 +86,18 @@ class Attention(nn.Module):
 
         # xformers requires (B=1, S, H, D)
         xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(xq, key, val, mask if cache is None else cache.mask)
+        timing = get_current_timing()
+        phase = get_current_phase()
+        if timing is not None and phase in ("prefill", "decode"):
+            output, elapsed_ms = measure_gpu_ms_if_available(
+                lambda: memory_efficient_attention(xq, key, val, mask if cache is None else cache.mask)
+            )
+            if phase == "prefill":
+                timing.attn_prefill_ms += elapsed_ms
+            else:
+                timing.attn_decode_ms += elapsed_ms
+        else:
+            output = memory_efficient_attention(xq, key, val, mask if cache is None else cache.mask)
         output = output.view(seqlen_sum, self.n_heads * self.head_dim)
 
         assert isinstance(output, torch.Tensor)

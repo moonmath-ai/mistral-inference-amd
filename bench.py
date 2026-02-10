@@ -10,6 +10,7 @@ import torch
 from openai import OpenAI
 
 from chat import Chat
+from mistral_inference.timing import StageTiming
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="7b_instruct_v.3")
@@ -21,6 +22,11 @@ parser.add_argument(
     choices=("none", "python", "torch", "rocprof"),
     default="none",
     help="Profiling mode: none (default), python (cProfile), torch, or rocprof.",
+)
+parser.add_argument(
+    "--stage-timing",
+    action="store_true",
+    help="Collect stage-level timing (tokenization/prefill/decode/attention/MoE) for native path.",
 )
 args = parser.parse_args()
 
@@ -150,6 +156,7 @@ def run_vllm_benchmark(model_name, prompt_list):
 
 def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
     raw_latencies, output_tokens_counts, tps_list = [], [], []
+    stage_timings: list[StageTiming] = []
 
     model_path =os.path.expanduser(f"~/models/{model_name}")
     model_name = MODEL_FULL_NAMES[model_name]
@@ -176,8 +183,12 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
 
     for i, prompt in enumerate(prompt_list):
         start_time = time.perf_counter()
-        
-        response, nof_tokens = chat(prompt)
+
+        if args.stage_timing:
+            response, nof_tokens, timing = chat(prompt, return_timing=True)
+            stage_timings.append(timing)
+        else:
+            response, nof_tokens = chat(prompt)
         
         end_time = time.perf_counter()
         latency = end_time - start_time
@@ -189,6 +200,19 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
         prompt_stat_str = f"Prompt {i+1} Done: {nof_tokens} tokens in {latency:.3f}s"
         print(prompt_stat_str)
         out_run_str += prompt_stat_str + "\n"
+        if args.stage_timing:
+            stage_str = (
+                f"  tokenization={timing.tokenization_ms:.2f}ms | "
+                f"prefill={timing.prefill_ms:.2f}ms ({timing.prefill_tps:.2f} tok/s) | "
+                f"ttft={timing.ttft_ms:.2f}ms | "
+                f"decode={timing.decode_ms:.2f}ms ({timing.decode_tps:.2f} tok/s) | "
+                f"attn_prefill={timing.attn_prefill_ms:.2f}ms | "
+                f"attn_decode={timing.attn_decode_ms:.2f}ms | "
+                f"moe_dispatch+combine_decode={timing.moe_dispatch_combine_decode_ms:.2f}ms | "
+                f"moe_expert_gemm_decode={timing.moe_expert_gemm_decode_ms:.2f}ms"
+            )
+            print(stage_str)
+            out_run_str += stage_str + "\n"
 
         # Create safe filename
         clean_name = "".join(c for c in prompt[:20] if c.isalnum() or c==' ').replace(" ", "_")
@@ -201,6 +225,20 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
     print("\nAll outputs saved to output/benchmarks/")
 
     output_summary = f"\n\n{"="*50}\nModel: {model_name}_{output_suffix}\n{"-"*50}\nTokens Per Second: {np.mean(tps_list):.2f} ± {np.std(tps_list):.2f}\n{"="*50}\n"
+    if args.stage_timing and stage_timings:
+        output_summary += (
+            f"Stage timing averages across prompts:\n"
+            f"  Tokenization: {np.mean([t.tokenization_ms for t in stage_timings]):.2f} ms\n"
+            f"  Prefill total: {np.mean([t.prefill_ms for t in stage_timings]):.2f} ms\n"
+            f"  Prefill TPS: {np.mean([t.prefill_tps for t in stage_timings]):.2f} tok/s\n"
+            f"  TTFT: {np.mean([t.ttft_ms for t in stage_timings]):.2f} ms\n"
+            f"  Decode total: {np.mean([t.decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  Decode TPS: {np.mean([t.decode_tps for t in stage_timings]):.2f} tok/s\n"
+            f"  Attention prefill: {np.mean([t.attn_prefill_ms for t in stage_timings]):.2f} ms\n"
+            f"  Attention decode: {np.mean([t.attn_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE dispatch+combine (decode): {np.mean([t.moe_dispatch_combine_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE expert GEMM (decode): {np.mean([t.moe_expert_gemm_decode_ms for t in stage_timings]):.2f} ms\n"
+        )
     print(output_summary)
 
     with open(f"output/benchmarks/{model_name_short}/{prefix}_summary_{output_suffix}.txt", "w") as f:

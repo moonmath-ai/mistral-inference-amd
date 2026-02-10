@@ -1,10 +1,12 @@
 from typing import List, Optional, Tuple
+from time import perf_counter
 
 import numpy as np
 import torch
 
 from mistral_inference.cache import BufferCache
 from mistral_inference.mamba import Mamba
+from mistral_inference.timing import StageTiming, timing_scope
 from mistral_inference.transformer import Transformer
 
 
@@ -50,6 +52,7 @@ def generate(
     temperature: float,
     chunk_size: Optional[int] = None,
     eos_id: Optional[int] = None,
+    timing: Optional[StageTiming] = None,
 ) -> Tuple[List[List[int]], List[List[float]]]:
     images_torch: List[List[torch.Tensor]] = []
     if images:
@@ -89,15 +92,21 @@ def generate(
     flattened_images: List[torch.Tensor] = sum(images_torch, [])
 
     # Encode prompt by chunks
+    prefill_start = perf_counter()
+    ttft_anchor = prefill_start
+    prefill_token_count = 0
     for s in range(0, max_prompt_len, chunk_size):
         prompt_chunks = [p[s : s + chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
-        prelogits = model.forward(
-            torch.tensor(sum(prompt_chunks, []), device=model.device, dtype=torch.long),
-            images=flattened_images,
-            seqlens=[len(p) for p in prompt_chunks],
-            cache=cache,
-        )
+        chunk_seqlens = [len(p) for p in prompt_chunks]
+        prefill_token_count += sum(chunk_seqlens)
+        with timing_scope(timing, phase="prefill"):
+            prelogits = model.forward(
+                torch.tensor(sum(prompt_chunks, []), device=model.device, dtype=torch.long),
+                images=flattened_images,
+                seqlens=chunk_seqlens,
+                cache=cache,
+            )
         logits = torch.log_softmax(prelogits, dim=-1)
 
         if last_token_prelogits is not None:
@@ -116,14 +125,23 @@ def generate(
             torch.tensor([len(p) for p in prompt_chunks], device=prelogits.device).cumsum(dim=0) - 1,
         )
         assert last_token_prelogits.shape == (B, V)
+    prefill_end = perf_counter()
+    if timing is not None:
+        timing.prefill_ms += (prefill_end - prefill_start) * 1000.0
+        timing.prefill_tokens += prefill_token_count
 
     # decode
     generated_tensors = []
     is_finished = torch.tensor([False for _ in range(B)])
+    decode_start = perf_counter()
+    ttft_recorded = False
 
     assert last_token_prelogits is not None
     for _ in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
+        if timing is not None and not ttft_recorded:
+            timing.ttft_ms += (perf_counter() - ttft_anchor) * 1000.0
+            ttft_recorded = True
 
         if eos_id is not None:
             is_finished = is_finished | (next_token == eos_id).cpu()
@@ -136,14 +154,20 @@ def generate(
             logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tensors.append(next_token[:, None])
-        last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
+        with timing_scope(timing, phase="decode"):
+            last_token_prelogits = model.forward(next_token, seqlens=[1] * B, cache=cache)
         assert last_token_prelogits.shape == (B, V)
+    decode_end = perf_counter()
+    if timing is not None:
+        timing.decode_ms += (decode_end - decode_start) * 1000.0
 
     generated_tokens: List[List[int]]
     if generated_tensors:
         generated_tokens = torch.cat(generated_tensors, 1).tolist()
     else:
         generated_tokens = []
+    if timing is not None:
+        timing.decode_tokens += sum(len(seq) for seq in generated_tokens)
 
     return generated_tokens, logprobs
 
