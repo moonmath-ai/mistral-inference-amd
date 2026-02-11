@@ -21,6 +21,12 @@ class StageTiming:
     attn_decode_ms: float = 0.0
     moe_dispatch_combine_decode_ms: float = 0.0
     moe_expert_gemm_decode_ms: float = 0.0
+    moe_gate_decode_ms: float = 0.0
+    moe_topk_decode_ms: float = 0.0
+    moe_softmax_decode_ms: float = 0.0
+    moe_route_extract_decode_ms: float = 0.0
+    moe_gather_decode_ms: float = 0.0
+    moe_combine_decode_ms: float = 0.0
 
     @property
     def prefill_tps(self) -> float:

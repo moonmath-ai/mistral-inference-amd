@@ -213,6 +213,16 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
             )
             print(stage_str)
             out_run_str += stage_str + "\n"
+            moe_breakdown_str = (
+                f"    moe_gate={timing.moe_gate_decode_ms:.2f}ms | "
+                f"moe_topk={timing.moe_topk_decode_ms:.2f}ms | "
+                f"moe_softmax={timing.moe_softmax_decode_ms:.2f}ms | "
+                f"moe_route_extract={timing.moe_route_extract_decode_ms:.2f}ms | "
+                f"moe_gather={timing.moe_gather_decode_ms:.2f}ms | "
+                f"moe_combine={timing.moe_combine_decode_ms:.2f}ms"
+            )
+            print(moe_breakdown_str)
+            out_run_str += moe_breakdown_str + "\n"
 
         # Create safe filename
         clean_name = "".join(c for c in prompt[:20] if c.isalnum() or c==' ').replace(" ", "_")
@@ -238,6 +248,12 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
             f"  Attention decode: {np.mean([t.attn_decode_ms for t in stage_timings]):.2f} ms\n"
             f"  MoE dispatch+combine (decode): {np.mean([t.moe_dispatch_combine_decode_ms for t in stage_timings]):.2f} ms\n"
             f"  MoE expert GEMM (decode): {np.mean([t.moe_expert_gemm_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE gate (decode): {np.mean([t.moe_gate_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE topk (decode): {np.mean([t.moe_topk_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE softmax (decode): {np.mean([t.moe_softmax_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE route_extract (decode): {np.mean([t.moe_route_extract_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE gather (decode): {np.mean([t.moe_gather_decode_ms for t in stage_timings]):.2f} ms\n"
+            f"  MoE combine (decode): {np.mean([t.moe_combine_decode_ms for t in stage_timings]):.2f} ms\n"
         )
     print(output_summary)
 

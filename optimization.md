@@ -1,0 +1,44 @@
+# Optimization Results Summary
+
+## Initial vs Current Timing
+
+| Metric | Initial (baseline) | Current | Delta |
+|---|---:|---:|---:|
+| Tokens Per Second | 11.41 | 15.52 | +4.11 (+36.0%) |
+| Decode TPS | 11.55 | 14.09 | +2.54 (+22.0%) |
+| Decode total (ms) | 23068.05 | 19021.65 | -4046.40 (-17.5%) |
+| Prefill total (ms) | 106.16 | 111.24 | +5.08 (+4.8%) |
+| TTFT (ms) | 106.20 | 111.27 | +5.07 (+4.8%) |
+| Attention decode (ms) | 1059.14 | 1002.29 | -56.85 (-5.4%) |
+| MoE dispatch+combine decode (ms) | 8411.73 | 6546.35 | -1865.38 (-22.2%) |
+| MoE expert GEMM decode (ms) | 5157.18 | 3099.07 | -2058.11 (-39.9%) |
+
+Notes:
+- `Tokens Per Second` compares **non-instrumented** runs (without `--stage-timing`), i.e. production throughput.
+- Decode-stage rows come from instrumented runs (`--stage-timing`) and are used for attribution, not absolute TPS.
+
+## MoE Dispatch+Combine Work and Measurements
+
+### What we targeted
+- Decode bottleneck in Mixtral was MoE, especially dispatch+combine overhead.
+- Goal: reduce routing/indexing/combining overhead while preserving expert correctness.
+
+### Changes made
+1. **First pass**
+   - Flattened routing data and introduced `index_add_` for combine.
+   - Added route sorting by expert.
+2. **Second pass (current best)**
+   - Removed global route sort (it added overhead in decode).
+   - Kept flattened routing and `index_add_`.
+   - Used per-expert route extraction from flattened assignments.
+
+### Timing progression (decode averages)
+| Run | MoE dispatch+combine (ms) | MoE expert GEMM (ms) | Decode TPS | Notes |
+|---|---:|---:|---:|---|
+| Baseline | 8411.73 | 5157.18 | 11.55 | Starting point |
+| After first pass | 9549.66 | 3192.83 | 12.06 | Dispatch worsened, expert compute improved |
+| After second pass (current) | 6546.35 | 3099.07 | 14.09 | Dispatch improved strongly; best overall |
+
+### Net outcome
+- We achieved a significant decode speedup primarily by improving MoE path efficiency.
+- Best measured production throughput (no stage instrumentation): **15.52 ± 0.26 TPS**.

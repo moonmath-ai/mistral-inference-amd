@@ -1,4 +1,16 @@
+
+## Baseline
+
+Tokens Per Second: 11.39 ± 0.49
+
 ## Stage Timing Report (Mixtral-8x7B, `--stage-timing`, averages)
+
+
+
+
+
+
+
 
 | Metric | Value |
 |---|---|
