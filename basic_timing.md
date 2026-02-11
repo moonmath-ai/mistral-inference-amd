@@ -37,7 +37,7 @@ Add stage-level timing for native benchmark runs in a non-breaking way.
 Enabled by
 ----------
 Use:
-  python bench.py --model model 8x7b_instruct_v.1 --stage-timing
+  python bench.py --model 8x7b_instruct_v.1 --stage-timing
 
 Default behavior is unchanged when `--stage-timing` is not set.
 
