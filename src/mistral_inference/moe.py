@@ -82,15 +82,20 @@ class MoeLayer(nn.Module):
 
         expert_ms = 0.0
         for i, expert in enumerate(self.experts):
-            route_pos = torch.nonzero(flat_experts == i, as_tuple=False).flatten()
+            # Keep expert loop static (no tensor->python sync for dynamic ids),
+            # but use index_select for faster gathers on ROCm.
+            route_pos = torch.where(flat_experts == i)[0]
             if timed_decode:
                 (token_idx, token_weights), gather_ms = measure_gpu_ms_if_available(
-                    lambda: (flat_tokens[route_pos], flat_weights[route_pos])
+                    lambda: (
+                        flat_tokens.index_select(0, route_pos),
+                        flat_weights.index_select(0, route_pos),
+                    )
                 )
                 timing.moe_gather_decode_ms += gather_ms
             else:
-                token_idx = flat_tokens[route_pos]
-                token_weights = flat_weights[route_pos]
+                token_idx = flat_tokens.index_select(0, route_pos)
+                token_weights = flat_weights.index_select(0, route_pos)
             if token_idx.numel() == 0:
                 continue
             if timed_decode:
@@ -99,13 +104,14 @@ class MoeLayer(nn.Module):
             else:
                 expert_out = expert(inputs.index_select(0, token_idx))
             # Combine expert outputs with weighted index accumulation.
+            expert_out.mul_(token_weights.unsqueeze(1))
             if timed_decode:
                 _, combine_ms = measure_gpu_ms_if_available(
-                    lambda: results.index_add_(0, token_idx, expert_out * token_weights.unsqueeze(1))
+                    lambda: results.index_add_(0, token_idx, expert_out)
                 )
                 timing.moe_combine_decode_ms += combine_ms
             else:
-                results.index_add_(0, token_idx, expert_out * token_weights.unsqueeze(1))
+                results.index_add_(0, token_idx, expert_out)
         if timed_decode and timing is not None:
             if total_end_evt is not None and total_start_evt is not None:
                 total_end_evt.record()

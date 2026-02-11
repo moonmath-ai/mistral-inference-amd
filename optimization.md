@@ -4,7 +4,7 @@
 
 | Metric | Initial (baseline) | Current | Delta |
 |---|---:|---:|---:|
-| Tokens Per Second | 11.41 | 15.52 | +4.11 (+36.0%) |
+| Tokens Per Second | 11.41 | 15.78 | +4.37 (+38.3%) |
 | Decode TPS | 11.55 | 14.09 | +2.54 (+22.0%) |
 | Decode total (ms) | 23068.05 | 19021.65 | -4046.40 (-17.5%) |
 | Prefill total (ms) | 106.16 | 111.24 | +5.08 (+4.8%) |
@@ -41,4 +41,19 @@ Notes:
 
 ### Net outcome
 - We achieved a significant decode speedup primarily by improving MoE path efficiency.
-- Best measured production throughput (no stage instrumentation): **15.52 ± 0.26 TPS**.
+- Best measured production throughput (no stage instrumentation): **15.78 ± 0.39 TPS**.
+
+## MoE Dispatch+Combine Speedup Analysis
+
+### What the numbers say
+- **Production throughput improved strongly**: 11.41 -> 15.78 TPS (**+38.3%**).
+- On comparable coarse stage-timing runs, MoE dispatch+combine improved from:
+  - **8411.73 ms -> 6546.35 ms** (**-22.2%**).
+- This dispatch+combine reduction is the primary contributor to decode speedup.
+
+### Important measurement caveat
+- Fine-grained MoE sub-stage timing (`moe_gate`, `moe_topk`, `moe_gather`, etc.) introduces extra synchronization.
+- Because of that instrumentation overhead, absolute dispatch+combine values in those runs are inflated and **not directly comparable** to coarse timing or production TPS.
+- Use:
+  - **no `--stage-timing`** for final TPS comparisons,
+  - **`--stage-timing`** for bottleneck attribution only.
