@@ -23,6 +23,24 @@ class MoeLayer(nn.Module):
         self.experts = nn.ModuleList(experts)
         self.gate = gate
         self.args = moe_args
+        # Cache flattened token indices for (num_tokens, topk, device) to avoid
+        # rebuilding arange/expand every forward.
+        self._flat_tokens_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+
+    def _get_flat_tokens(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        key = (num_tokens, self.args.num_experts_per_tok, str(device))
+        cached = self._flat_tokens_cache.get(key, None)
+        if cached is not None:
+            return cached
+        k = self.args.num_experts_per_tok
+        flat_tokens = (
+            torch.arange(num_tokens, device=device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand(num_tokens, k)
+            .reshape(-1)
+        )
+        self._flat_tokens_cache[key] = flat_tokens
+        return flat_tokens
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         timing = get_current_timing()
@@ -55,16 +73,10 @@ class MoeLayer(nn.Module):
         # We avoid global sort (can be expensive for decode) and still keep
         # combine as index_add_ for efficient accumulation.
         num_tokens = inputs.shape[0]
-        k = self.args.num_experts_per_tok
         if timed_decode:
             def _route_extract():
                 _flat_experts = selected_experts.reshape(-1)
-                _flat_tokens = (
-                    torch.arange(num_tokens, device=inputs.device, dtype=torch.long)
-                    .unsqueeze(1)
-                    .expand(num_tokens, k)
-                    .reshape(-1)
-                )
+                _flat_tokens = self._get_flat_tokens(num_tokens, inputs.device)
                 _flat_weights = weights.reshape(-1)
                 return _flat_experts, _flat_tokens, _flat_weights
 
@@ -72,18 +84,16 @@ class MoeLayer(nn.Module):
             timing.moe_route_extract_decode_ms += route_ms
         else:
             flat_experts = selected_experts.reshape(-1)
-            flat_tokens = (
-                torch.arange(num_tokens, device=inputs.device, dtype=torch.long)
-                .unsqueeze(1)
-                .expand(num_tokens, k)
-                .reshape(-1)
-            )
+            flat_tokens = self._get_flat_tokens(num_tokens, inputs.device)
             flat_weights = weights.reshape(-1)
 
         expert_ms = 0.0
-        for i, expert in enumerate(self.experts):
-            # Keep expert loop static (no tensor->python sync for dynamic ids),
-            # but use index_select for faster gathers on ROCm.
+        # Process only active experts in this step (important for decode where topk is small).
+        active_experts = torch.unique(flat_experts)
+        for expert_id_t in active_experts:
+            i = int(expert_id_t.item())
+            expert = self.experts[i]
+            # Use index_select for faster gathers on ROCm.
             route_pos = torch.where(flat_experts == i)[0]
             if timed_decode:
                 (token_idx, token_weights), gather_ms = measure_gpu_ms_if_available(

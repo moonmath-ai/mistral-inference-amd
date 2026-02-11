@@ -4,7 +4,7 @@
 
 | Metric | Initial (baseline) | Current | Delta |
 |---|---:|---:|---:|
-| Tokens Per Second | 11.41 | 15.78 | +4.37 (+38.3%) |
+| Tokens Per Second | 11.41 | 18.19 | +6.78 (+59.4%) |
 | Decode TPS | 11.55 | 14.09 | +2.54 (+22.0%) |
 | Decode total (ms) | 23068.05 | 19021.65 | -4046.40 (-17.5%) |
 | Prefill total (ms) | 106.16 | 111.24 | +5.08 (+4.8%) |
@@ -31,6 +31,10 @@ Notes:
    - Removed global route sort (it added overhead in decode).
    - Kept flattened routing and `index_add_`.
    - Used per-expert route extraction from flattened assignments.
+3. **Aggressive MI300X-focused pass (current best production TPS)**
+   - Process only active experts per decode step (`torch.unique(flat_experts)`).
+   - Cache flattened token index tensor to avoid rebuilding route index scaffolding each forward.
+   - Keep ROCm-friendly `index_select` gather and in-place scale + `index_add_` combine.
 
 ### Timing progression (decode averages)
 | Run | MoE dispatch+combine (ms) | MoE expert GEMM (ms) | Decode TPS | Notes |
@@ -41,12 +45,13 @@ Notes:
 
 ### Net outcome
 - We achieved a significant decode speedup primarily by improving MoE path efficiency.
-- Best measured production throughput (no stage instrumentation): **15.78 ± 0.39 TPS**.
+- Best measured production throughput (no stage instrumentation): **18.19 ± 0.32 TPS**.
 
 ## MoE Dispatch+Combine Speedup Analysis
 
 ### What the numbers say
-- **Production throughput improved strongly**: 11.41 -> 15.78 TPS (**+38.3%**).
+- **Production throughput improved strongly**: 11.41 -> 18.19 TPS (**+59.4%**).
+- Latest aggressive pass improved production TPS from 15.78 -> 18.19 (**+15.3%** incremental).
 - On comparable coarse stage-timing runs, MoE dispatch+combine improved from:
   - **8411.73 ms -> 6546.35 ms** (**-22.2%**).
 - This dispatch+combine reduction is the primary contributor to decode speedup.
