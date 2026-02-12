@@ -3,6 +3,7 @@ import cProfile
 import os
 import pstats
 import time
+import asyncio
 
 import numpy as np
 import requests
@@ -76,6 +77,70 @@ prompts = [
     "Do you dream of electric sheep?",
     "Who keeps their coffee cold for a day?"
 ]
+
+# Helper to fetch a single completion as an async task
+async def fetch_completion(client, model, prompt):
+    # We use run_in_executor because the OpenAI client is synchronous
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, 
+        lambda: client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+    )
+
+async def run_vllm_concurrent_benchmark(model_name, prompt_list):
+    full_model_name = MODEL_FULL_NAMES[model_name]
+    
+    # 1. Warmup (Sequential, just to bake the kernels/CUDA graphs)
+    print("Warming up model...")
+    client.chat.completions.create(
+        model=full_model_name,
+        messages=[{"role": "user", "content": "Hello"}]
+    )
+
+    # 2. Capture baseline metrics
+    before = get_vllm_internal_metrics()
+    start_wall = time.perf_counter()
+
+    # 3. Launch all prompts concurrently
+    print(f"Launching {len(prompt_list)} parallel requests...")
+    tasks = [fetch_completion(client, full_model_name, p) for p in prompt_list]
+    responses = await asyncio.gather(*tasks)
+    
+    # 4. Capture ending metrics
+    end_wall = time.perf_counter()
+    after = get_vllm_internal_metrics()
+
+    # --- Metrics Logic ---
+    duration = end_wall - start_wall
+    
+    # Total generated tokens across all requests
+    gen_tokens = (after.get("vllm:generation_tokens_total", 0) - 
+                  before.get("vllm:generation_tokens_total", 0))
+    
+    # Total prompt tokens processed (Prefill)
+    prompt_tokens = (after.get("vllm:prompt_tokens_total", 0) - 
+                     before.get("vllm:prompt_tokens_total", 0))
+
+    # System-wide Throughput (The "Real" TPS of the MI300X)
+    system_tps = gen_tokens / duration if duration > 0 else 0
+    
+    # TTFT Average (Using vLLM's internal histogram)
+    ttft_sum = (after.get("vllm:time_to_first_token_seconds_sum", 0) - 
+                before.get("vllm:time_to_first_token_seconds_sum", 0))
+    ttft_count = (after.get("vllm:time_to_first_token_seconds_count", 0) - 
+                  before.get("vllm:time_to_first_token_seconds_count", 0))
+    avg_ttft = ttft_sum / ttft_count if ttft_count > 0 else 0
+
+    print(f"\n{'='*50}")
+    print(f"Concurrency Level: {len(prompt_list)}")
+    print(f"Total Output Tokens: {int(gen_tokens)}")
+    print(f"Wall Clock Duration: {duration:.2f}s")
+    print(f"System Throughput: {system_tps:.2f} tokens/s")
+    print(f"Avg TTFT (Internal): {avg_ttft:.4f}s")
+    print(f"{'='*50}\n")
 
 def run_vllm_benchmark(model_name, prompt_list):
     results_summary = []
@@ -264,7 +329,8 @@ if __name__ == "__main__":
     num_gpus_str = "multigpu" if args.multigpu else "single_gpu"
     if args.vllm:
         print(f"Benchmarking {num_gpus_str} with vLLM...")
-        run_vllm_benchmark(args.model, prompts)
+        # run_vllm_benchmark(args.model, prompts)
+        asyncio.run(run_vllm_concurrent_benchmark(args.model, prompts))
     else:
         if args.profile == "python":
             print(f"Benchmarking {num_gpus_str} with Mistral functions (Python profiler)...")
