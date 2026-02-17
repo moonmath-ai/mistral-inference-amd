@@ -16,6 +16,7 @@ from mistral_inference.timing import StageTiming
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="7b_instruct_v.3")
 parser.add_argument("--vllm", action="store_true")
+parser.add_argument("--concurrent", action="store_true")
 parser.add_argument("--multigpu", action="store_true")
 parser.add_argument(
     "--profile",
@@ -37,8 +38,9 @@ MODEL_FULL_NAMES = {
     "8x22b_instruct_v.3": "mistralai/Mixtral-8x22B-Instruct-v0.1",
 }
 
-METRICS_URL = "http://localhost:8000/metrics"
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+VLLM_BASE_URL = "http://localhost:8000"
+METRICS_URL = f"{VLLM_BASE_URL}/metrics"
+client = OpenAI(base_url=f"{VLLM_BASE_URL}/v1", api_key="not-needed")
 
 # Ensure output directory exists
 os.makedirs("output/benchmarks", exist_ok=True)
@@ -62,21 +64,21 @@ def get_vllm_internal_metrics():
         return {}
 
 prompts = [
-    "Say 'Hello' and nothing else.",
+    # "Say 'Hello' and nothing else.",
     "Write a poem about coding, with three verses and a chorus.",
-    "Explain quantum physics to a five-year-old in three paragraphs.",
-    "Summarize the plot of Inception.",
-    "Write a 200-word story about a space-faring armadillo.",
-    "Explain the importance of the Navier-Stokes equations for fluid dynamics.",
-# ]
+    # "Explain quantum physics to a five-year-old in three paragraphs.",
+    # "Summarize the plot of Inception.",
+    # "Write a 200-word story about a space-faring armadillo.",
+    # "Explain the importance of the Navier-Stokes equations for fluid dynamics.",
+]
 
 # prompts = [
-    "How many wood can a woodchuck protect if the industrial machine comes to the forest? Present startegies for optimal defense.",
-    "If the entire world is a very narrow bridge, can we approximate it to be a one dimensional line? How would this affect the physics of the world?",
-    "Translate 'where is the library?' to greek and turkish.",
-    "Do you dream of electric sheep?",
-    "Who keeps their coffee cold for a day?"
-]
+#     "How many wood can a woodchuck protect if the industrial machine comes to the forest? Present startegies for optimal defense.",
+#     "If the entire world is a very narrow bridge, can we approximate it to be a one dimensional line? How would this affect the physics of the world?",
+#     "Translate 'where is the library?' to greek and turkish.",
+#     "Do you dream of electric sheep?",
+#     "Who keeps their coffee cold for a day?"
+# ]
 
 # Helper to fetch a single completion as an async task
 async def fetch_completion(client, model, prompt):
@@ -104,11 +106,20 @@ async def run_vllm_concurrent_benchmark(model_name, prompt_list):
     before = get_vllm_internal_metrics()
     start_wall = time.perf_counter()
 
+    # 2.5 Trigger profile start
+    if args.profile != "none":
+        print("Starting profile...")
+        requests.post(f"{VLLM_BASE_URL}/start_profile")
+
     # 3. Launch all prompts concurrently
     print(f"Launching {len(prompt_list)} parallel requests...")
     tasks = [fetch_completion(client, full_model_name, p) for p in prompt_list]
     responses = await asyncio.gather(*tasks)
     
+    if args.profile != "none":
+        print("Stopping profile...")
+        requests.post(f"{VLLM_BASE_URL}/stop_profile")
+
     # 4. Capture ending metrics
     end_wall = time.perf_counter()
     after = get_vllm_internal_metrics()
@@ -163,6 +174,11 @@ def run_vllm_benchmark(model_name, prompt_list):
     response_text = response.choices[0].message.content
     print(f"Warmed up model - response:\n{response_text}\n\n")
 
+    # 2.5 Trigger profile start
+    if args.profile != "none":
+        print("Starting profile...")
+        requests.post(f"{VLLM_BASE_URL}/start_profile")
+
     out_run_str = ""
 
     for i, prompt in enumerate(prompt_list):
@@ -208,6 +224,10 @@ def run_vllm_benchmark(model_name, prompt_list):
         with open(f"output/benchmarks/{model_name_short}/vllm_output_{i}_{clean_name}_{output_suffix}.txt", "w") as f:
             f.write(f"Prompt: {prompt}\n\nOutput:\n{response_text}")
 
+    if args.profile != "none":
+        print("Stopping profile...")
+        requests.post(f"{VLLM_BASE_URL}/stop_profile")
+    
     time_to_first_token_avg = np.mean([result["ttft"] for result in results_summary])
     time_to_first_token_std = np.std([result["ttft"] for result in results_summary])
     tokens_per_second_avg = np.mean([result["tps"] for result in results_summary])
@@ -328,9 +348,12 @@ def run_mistral_benchmark(model_name, prompt_list, prefix="native"):
 if __name__ == "__main__":
     num_gpus_str = "multigpu" if args.multigpu else "single_gpu"
     if args.vllm:
-        print(f"Benchmarking {num_gpus_str} with vLLM...")
-        # run_vllm_benchmark(args.model, prompts)
-        asyncio.run(run_vllm_concurrent_benchmark(args.model, prompts))
+        if args.concurrent:
+            print(f"Benchmarking {num_gpus_str} with vLLM (concurrent)...")
+            asyncio.run(run_vllm_concurrent_benchmark(args.model, prompts))
+        else:
+            print(f"Benchmarking {num_gpus_str} with vLLM (sequential)...")
+            run_vllm_benchmark(args.model, prompts)
     else:
         if args.profile == "python":
             print(f"Benchmarking {num_gpus_str} with Mistral functions (Python profiler)...")
