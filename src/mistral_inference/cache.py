@@ -88,6 +88,11 @@ class CacheView:
         flat_cache_k = self.cache_k.view(-1, n_kv_heads, head_dim)
         flat_cache_v = self.cache_v.view(-1, n_kv_heads, head_dim)
 
+        if not self.metadata.prefill and xk.shape[0] == self.metadata.cache_positions.numel():
+            flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk)
+            flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv)
+            return
+
         flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk[self.metadata.to_cache_mask])
         flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv[self.metadata.to_cache_mask])
 
@@ -168,6 +173,10 @@ class BufferCache:
 
         # holds the valid length for each batch element in the cache
         self.kv_seqlens: Optional[torch.Tensor] = None
+        # Reused decode tensors keyed by batch size
+        self._decode_batch_idx_cache: dict[int, torch.Tensor] = {}
+        self._decode_to_cache_mask_cache: dict[int, torch.Tensor] = {}
+        self._decode_cached_elements_cache: dict[int, torch.Tensor] = {}
 
     def get_view(self, layer_id: int, metadata: CacheInputMetadata) -> CacheView:
         assert self.kv_seqlens is not None
@@ -187,6 +196,10 @@ class BufferCache:
         for i in range(self.n_layers):
             self.cache_k[i] = self.cache_k[i].to(device=device, dtype=dtype)
             self.cache_v[i] = self.cache_v[i].to(device=device, dtype=dtype)
+        # Cached decode buffers are device-bound; rebuild lazily.
+        self._decode_batch_idx_cache.clear()
+        self._decode_to_cache_mask_cache.clear()
+        self._decode_cached_elements_cache.clear()
 
         return self
 
@@ -214,11 +227,78 @@ class BufferCache:
         assert len(seqlens) == len(
             self.kv_seqlens
         ), f"Batch size is {len(self.kv_seqlens)}, got {len(seqlens)}, did you forget to reset cache?"
-        seqpos = self.kv_seqlens.tolist()
         assert len(seqlens) > 0, seqlens
 
+        # Fast path for decode where every sequence contributes exactly one token.
+        if all(seqlen == 1 for seqlen in seqlens):
+            return self._get_input_metadata_decode_fast(seqlens)
+
+        seqpos = self.kv_seqlens.tolist()
         for cache_size in self.cache_sizes:
             metadata.append(self._get_input_metadata_layer(cache_size, seqlens, seqpos))
+
+        return metadata
+
+    def _get_decode_buffers(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_idx = self._decode_batch_idx_cache.get(batch_size)
+        if batch_idx is None:
+            batch_idx = torch.arange(batch_size, device=self.device, dtype=torch.long)
+            self._decode_batch_idx_cache[batch_size] = batch_idx
+
+        to_cache_mask = self._decode_to_cache_mask_cache.get(batch_size)
+        if to_cache_mask is None:
+            to_cache_mask = torch.ones(batch_size, device=self.device, dtype=torch.bool)
+            self._decode_to_cache_mask_cache[batch_size] = to_cache_mask
+
+        cached_elements = self._decode_cached_elements_cache.get(batch_size)
+        if cached_elements is None:
+            cached_elements = torch.ones(batch_size, device=self.device, dtype=torch.long)
+            self._decode_cached_elements_cache[batch_size] = cached_elements
+
+        return batch_idx, to_cache_mask, cached_elements
+
+    def _get_input_metadata_decode_fast(self, seqlens: List[int]) -> List[CacheInputMetadata]:
+        assert self.kv_seqlens is not None
+        batch_size = len(seqlens)
+        batch_idx, to_cache_mask, cached_elements = self._get_decode_buffers(batch_size)
+        positions = self.kv_seqlens.clone()
+
+        cache_positions_by_size: dict[int, torch.Tensor] = {}
+        kv_seqlen_by_size: dict[int, List[int]] = {}
+        mask_by_size: dict[int, AttentionBias] = {}
+        kv_seqlens_plus_cached = self.kv_seqlens + cached_elements
+
+        metadata: List[CacheInputMetadata] = []
+        for cache_size in self.cache_sizes:
+            cache_positions = cache_positions_by_size.get(cache_size)
+            if cache_positions is None:
+                cache_positions = positions.remainder(cache_size) + batch_idx * cache_size
+                cache_positions_by_size[cache_size] = cache_positions
+
+            kv_seqlen = kv_seqlen_by_size.get(cache_size)
+            if kv_seqlen is None:
+                kv_seqlen = kv_seqlens_plus_cached.clamp(max=cache_size).tolist()
+                kv_seqlen_by_size[cache_size] = kv_seqlen
+
+            mask = mask_by_size.get(cache_size)
+            if mask is None:
+                mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+                    q_seqlen=seqlens,
+                    kv_padding=cache_size,
+                    kv_seqlen=kv_seqlen,
+                )
+                mask_by_size[cache_size] = mask
+            metadata.append(
+                CacheInputMetadata(
+                    positions=positions,
+                    to_cache_mask=to_cache_mask,
+                    cached_elements=cached_elements,
+                    cache_positions=cache_positions,
+                    prefill=False,
+                    mask=mask,
+                    seqlens=seqlens,
+                )
+            )
 
         return metadata
 
