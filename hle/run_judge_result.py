@@ -16,6 +16,13 @@ from datasets import load_dataset
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chat import Chat
 
+
+def get_question_id(q):
+    """Unique key for a question: use 'id' field if present, else dataset row index (_idx) as string."""
+    if "id" in q and q["id"] is not None:
+        return q["id"]
+    return str(q["_idx"])
+
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
 [question]: {question}
@@ -83,7 +90,7 @@ def extract_answer(chat, question, correct_answer, response_text, args):
 
 def add_judge_response(chat, question, predictions, args):
     """Run judge for one question. Returns (unique_id, prediction) or (None, None)."""
-    unique_id = question["id"]
+    unique_id = get_question_id(question)
     prediction = copy.deepcopy(predictions[unique_id])
     question_text = question["question"]
     correct_answer = question["answer"]
@@ -146,7 +153,7 @@ def calib_err(confidence, correct, p='2', beta=100):
 
     return cerr
 
-def dump_metrics(predictions, n): 
+def dump_metrics(predictions):
     correct = []
     confidence = []
     for k, v in predictions.items():
@@ -160,26 +167,29 @@ def dump_metrics(predictions, n):
     correct = np.array(correct)
     confidence = np.array(confidence) / 100
 
-    # sometimes model collapses on same questions
-    if len(correct) != n:
-        print(f"Available predictions: {len(correct)} | Total questions: {n}")
+    n_answered = len(correct)
+    if n_answered == 0:
+        print("*** Metrics *** (no judged responses)")
+        return
 
-
-    accuracy = round(100 * sum(correct) / n, 2)
+    # Accuracy = correct / answered (not over total dataset size)
+    accuracy = round(100 * sum(correct) / n_answered, 2)
     # Wald estimator, 95% confidence interval
-    confidence_half_width = round(1.96 * math.sqrt(accuracy * (100 - accuracy) / n), 2)
+    confidence_half_width = round(1.96 * math.sqrt(accuracy * (100 - accuracy) / n_answered), 2)
     calibration_error = 100 * round(calib_err(confidence, correct, p='2', beta=100), 2)
 
     print("*** Metrics ***")
-    print(f"Accuracy: {accuracy}% +/- {confidence_half_width}% | n = {n}")
+    print(f"Accuracy: {accuracy}% +/- {confidence_half_width}% | n = {n_answered} (answered)")
     print(f"Calibration Error: {calibration_error}")
 
 
 def main(args):
     output_filepath = f"judged_{os.path.basename(args.predictions)}.json"
-    dataset = load_dataset(args.dataset, split="test").to_dict()
-    questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
-    total_questions = len(questions)
+    dataset = load_dataset("openai/gsm8k", "main", split="test").to_dict()
+    questions = [
+        {**dict(zip(dataset.keys(), values)), "_idx": i}
+        for i, values in enumerate(zip(*dataset.values()))
+    ]
 
     with open(args.predictions, "r") as f:
         predictions = json.load(f)
@@ -190,13 +200,17 @@ def main(args):
     else:
         judged_predictions = {}
 
-    questions = [q for q in questions if q["id"] in predictions and q["id"] not in judged_predictions]
+    questions = [
+        q
+        for q in questions
+        if get_question_id(q) in predictions and get_question_id(q) not in judged_predictions
+    ]
 
     if not questions:
         print("No new questions to judge. All predictions already judged.")
         with open(output_filepath, "w") as f:
             json.dump(judged_predictions, f, indent=4)
-        dump_metrics(judged_predictions, n=total_questions)
+        dump_metrics(judged_predictions)
         return
 
     # Local judge: same interface as run_model_predictions (Chat from repo root)
@@ -218,12 +232,11 @@ def main(args):
     with open(output_filepath, "w") as f:
         json.dump(judged_predictions, f, indent=4)
 
-    dump_metrics(judged_predictions, n=total_questions)
+    dump_metrics(judged_predictions)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True, help="HLE HF Dataset")
     parser.add_argument("--predictions", type=str, required=True, help="Model predictions JSON from run_model_predictions.py")
     parser.add_argument(
         "--judge",
@@ -240,3 +253,5 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for judge sampling.")
     args = parser.parse_args()
     main(args)
+    
+# python run_judge_result.py --predictions hle_8x7b_instruct_v.1.json   --judge 8x7b_instruct_v.1   --max_completion_tokens 4096   --temperature 0.0

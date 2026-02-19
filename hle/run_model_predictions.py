@@ -15,6 +15,13 @@ from chat import Chat
 SYSTEM_PROMPT = "Your response should be in the following format:\nExplanation: {your explanation for your answer choice}\nAnswer: {your chosen answer}\nConfidence: {your confidence score between 0% and 100% for your answer}"
 
 
+def get_question_id(q):
+    """Unique key for a question: use 'id' field if present, else dataset row index (_idx) as string."""
+    if "id" in q and q["id"] is not None:
+        return q["id"]
+    return str(q["_idx"])
+
+
 def format_prompt(question):
     """Build a single prompt string for the Chat interface (text only)."""
     return SYSTEM_PROMPT + "\n\n" + question["question"]
@@ -36,14 +43,17 @@ def run_question(chat, question, args):
     if response is None:
         return None
     usage = {"completion_tokens": nof_tokens}
-    return question["id"], response, usage
+    return get_question_id(question), response, usage
 
 
 def main(args):
-    dataset = load_dataset(args.dataset, split="test").to_dict()
+    dataset = load_dataset("openai/gsm8k", "main", split="test").to_dict()
 
-    # Convert to list of dicts for iteration
-    questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
+    # Convert to list of dicts; attach row index for datasets without "id"
+    questions = [
+        {**dict(zip(dataset.keys(), values)), "_idx": i}
+        for i, values in enumerate(zip(*dataset.values()))
+    ]
 
     # Restrict to text-only first so max_samples is exact (no crop from dropping image questions)
     questions = [q for q in questions if not q.get("image")]
@@ -63,12 +73,12 @@ def main(args):
         model_path = os.path.expanduser(model_path)
 
     model_name = Path(model_path).name
-    output_filepath = f"hle_{model_name}.json"
+    output_filepath = f"predictions_{model_name}.json"
 
     if os.path.exists(output_filepath):
         with open(output_filepath, "r") as f:
             predictions = json.load(f)
-        questions = [q for q in questions if q["id"] not in predictions]
+        questions = [q for q in questions if get_question_id(q) not in predictions]
     else:
         predictions = {}
 
@@ -97,7 +107,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True, help="HLE HuggingFace dataset name")
     parser.add_argument(
         "--model",
         type=str,
@@ -126,4 +135,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args)
 
-# python3 run_model_predictions.py --dataset cais/hle --model 8x7b_instruct_v.1 --max_samples 200 --seed 0 --temperature 0 --max_completion_tokens 2048
+# python3 run_model_predictions.py --model 8x7b_instruct_v.1 --max_samples 200 --seed 0 --temperature 0 --max_completion_tokens 2048
